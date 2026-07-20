@@ -1251,6 +1251,43 @@ def test_canonical_events_v2_stopwatch_label_creates_namespaced_coverage():
     }
 
 
+def test_canonical_events_v2_keeps_configured_coverage_active():
+    generated = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "manual",
+                    ["manual"],
+                    ["label"],
+                    scope="global",
+                    keeps_active=True,
+                )
+            ],
+            active_time_sources=[
+                ActiveTimeSource("afk", ["afk"], scope="global")
+            ],
+            active_time_rule={
+                "type": "regex",
+                "source": "afk",
+                "field": "status",
+                "regex": "not-afk",
+            },
+            capabilities=[
+                "query.merge_subwatcher_fields.source_namespace.v1",
+                "query.active_periods_v2.v1",
+            ],
+        )
+    )
+
+    assert (
+        "not_afk = period_union(not_afk, activity_coverage_period_0);"
+        in generated
+    )
+    assert generated.index("period_union(not_afk") < generated.index(
+        "filter_period_intersect(events, not_afk)"
+    )
+
+
 def test_canonical_events_v2_ignores_unreferenced_currentwindow_bucket():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     end = start + timedelta(minutes=1)

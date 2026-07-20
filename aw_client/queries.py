@@ -79,6 +79,7 @@ class ActivityCoverageSource:
     host: Optional[str] = None
     bucket_hosts: Optional[Dict[str, str]] = None
     scope: Optional[Literal["host", "global"]] = None
+    keeps_active: bool = False
 
 
 @dataclass
@@ -326,6 +327,13 @@ def resolveActivityProfile(
                 active_code,
                 browser_code,
                 (
+                    activityCoverageActiveOverrides(
+                        params.activity_coverage_sources
+                    )
+                    if params.filter_afk
+                    else ""
+                ),
+                (
                     "events = filter_period_intersect(events, not_afk);"
                     if params.filter_afk
                     else ""
@@ -447,6 +455,9 @@ def canonicalEventsV2(params: CanonicalQueryParamsV2) -> str:
                     params.active_time_rule,
                     params.hostname,
                     enforce_source_hostname,
+                ),
+                activityCoverageActiveOverrides(
+                    params.activity_coverage_sources
                 ),
                 "events = filter_period_intersect(events, not_afk);",
             ]
@@ -760,6 +771,16 @@ def activityCoverageEvents(
             f"events, {variable}, {fields_variable}, {options_variable});\n"
         )
     return code
+
+
+def activityCoverageActiveOverrides(
+    sources: List[ActivityCoverageSource],
+) -> str:
+    return "\n".join(
+        f"not_afk = period_union(not_afk, activity_coverage_period_{index});"
+        for index, source in enumerate(sources)
+        if source.keeps_active
+    )
 
 
 def backgroundActivityEvents(
