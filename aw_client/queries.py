@@ -82,6 +82,21 @@ class ActivityCoverageSource:
 
 
 @dataclass
+class CanonicalQueryParamsV2:
+    """Inputs for the source-only canonical query pipeline."""
+
+    activity_coverage_sources: List[ActivityCoverageSource] = field(
+        default_factory=list
+    )
+    active_time_sources: List[ActiveTimeSource] = field(default_factory=list)
+    active_time_rule: Optional[Dict[str, Any]] = None
+    context_sources: List[ContextSource] = field(default_factory=list)
+    category_specs: Optional[List[Dict[str, Any]]] = None
+    hostname: Optional[str] = None
+    capabilities: List[str] = field(default_factory=list)
+
+
+@dataclass
 class _QueryParamsDefaultsBase:
     bid_browsers: List[str] = field(default_factory=list)
     classes: List[Tuple[List[str], dict]] = field(default_factory=list)
@@ -374,6 +389,84 @@ def canonicalEvents(params: Union[DesktopQueryParams, AndroidQueryParams]) -> st
     return resolveActivityProfile(params)
 
 
+def canonicalEventsV2(params: CanonicalQueryParamsV2) -> str:
+    """Build canonical events exclusively from explicitly named source roles."""
+    if params.hostname == "":
+        raise ValueError("hostname must be non-empty")
+    if params.active_time_rule is None and params.active_time_sources:
+        raise ValueError("active-time sources require an active-time rule")
+    if (
+        params.category_specs is not None
+        and "query.categorize_v2.v1" not in params.capabilities
+    ):
+        raise ValueError(
+            "flexible categorization requires server capability query.categorize_v2.v1"
+        )
+    if (
+        (params.context_sources or params.activity_coverage_sources)
+        and "query.merge_subwatcher_fields.source_namespace.v1"
+        not in params.capabilities
+    ):
+        raise ValueError(
+            "context enrichment requires server capability "
+            "query.merge_subwatcher_fields.source_namespace.v1"
+        )
+    if (
+        params.active_time_rule is not None
+        and "query.active_periods_v2.v1" not in params.capabilities
+    ):
+        raise ValueError(
+            "active-time expressions require server capability "
+            "query.active_periods_v2.v1"
+        )
+    fact_source_ids = [
+        source.source_id
+        for source in [*params.activity_coverage_sources, *params.context_sources]
+    ]
+    if len(fact_source_ids) != len(set(fact_source_ids)):
+        raise ValueError(
+            "canonical fact source ids must be unique across coverage and context"
+        )
+
+    enforce_source_hostname = (
+        "query.query_bucket_optional.expected_hostname.v1" in params.capabilities
+    )
+    code = [
+        "events = [];",
+        activityCoverageEvents(
+            params.activity_coverage_sources,
+            params.hostname,
+            enforce_source_hostname,
+        ),
+    ]
+    if params.active_time_rule is not None:
+        code.extend(
+            [
+                _active_time_events(
+                    params.active_time_sources,
+                    params.active_time_rule,
+                    params.hostname,
+                    enforce_source_hostname,
+                ),
+                "events = filter_period_intersect(events, not_afk);",
+            ]
+        )
+    code.append(
+        contextEvents(
+            params.context_sources,
+            params.hostname,
+            enforce_source_hostname,
+        )
+    )
+    if params.category_specs is not None:
+        category_specs = _serialize_query_json(params.category_specs)
+        hostname = (
+            f", {_serialize_query_json(params.hostname)}" if params.hostname else ""
+        )
+        code.append(f"events = categorize_v2(events, {category_specs}{hostname});")
+    return "\n".join(code)
+
+
 def pretty_query(query: str) -> str:
     return "\n".join([line.strip() for line in query.split("\n") if line.strip()])
 
@@ -454,6 +547,8 @@ def _source_bucket_ids(
     hostname: Optional[str],
     source_kind: str,
 ) -> List[str]:
+    if bucket_hosts == {}:
+        bucket_hosts = None
     if any(not isinstance(bucket_id, str) or not bucket_id for bucket_id in bucket_ids):
         raise ValueError(f"{source_kind} source bucket_ids must be non-empty strings")
     if len(bucket_ids) != len(set(bucket_ids)):
@@ -725,6 +820,7 @@ def _active_time_events(
 ) -> str:
     if not sources:
         raise ValueError("active-time expressions require at least one source")
+    _validate_unique_source_ids(sources, "active-time")
 
     code = ""
     named_sources = []

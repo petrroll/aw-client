@@ -3,9 +3,8 @@
 import json
 import logging
 import textwrap
-import time
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import click
@@ -22,6 +21,15 @@ td1day = timedelta(days=1)
 td1yr = timedelta(days=365)
 
 logger = logging.getLogger(__name__)
+
+_SOURCE_ONLY_QUERY_CAPABILITIES = {
+    "query.active_periods_v2.v1",
+    "query.categorize_v2.v1",
+    "query.merge_subwatcher_fields.source_namespace.v1",
+}
+_WINDOW_SOURCE_ID = "window"
+_WINDOW_APP_FIELD = f"$source.{_WINDOW_SOURCE_ID}.app"
+_WINDOW_TITLE_FIELD = f"$source.{_WINDOW_SOURCE_ID}.title"
 
 
 class _Context:
@@ -148,6 +156,117 @@ def query(
             )
 
 
+def _server_capabilities(client: aw_client.ActivityWatchClient) -> List[str]:
+    capabilities = client.get_info().get("capabilities", [])
+    return (
+        [capability for capability in capabilities if isinstance(capability, str)]
+        if isinstance(capabilities, list)
+        else []
+    )
+
+
+def _source_qualified_category_specs(
+    classes: List[Tuple[List[str], dict]],
+) -> List[Dict[str, Any]]:
+    specs = []
+    for index, (name, legacy_rule) in enumerate(classes):
+        rule = dict(legacy_rule)
+        if rule.get("regex"):
+            rule["type"] = "regex"
+            rule["source"] = _WINDOW_SOURCE_ID
+            select_keys = rule.pop("select_keys", None)
+            if select_keys:
+                if len(select_keys) == 1:
+                    rule["field"] = select_keys[0]
+                else:
+                    rule["fields"] = select_keys
+        else:
+            rule = {"type": "none"}
+        specs.append({"id": f"cli-legacy-{index}", "name": name, "rule": rule})
+    return specs
+
+
+def _canonical_query_for_capabilities(
+    hostname: str,
+    classes: List[Tuple[List[str], dict]],
+    capabilities: List[str],
+) -> Tuple[str, bool]:
+    if _SOURCE_ONLY_QUERY_CAPABILITIES.issubset(capabilities):
+        params = queries.CanonicalQueryParamsV2(
+            hostname=hostname,
+            activity_coverage_sources=[
+                queries.ActivityCoverageSource(
+                    _WINDOW_SOURCE_ID,
+                    [f"aw-watcher-window_{hostname}"],
+                    ["app", "title"],
+                    host=hostname,
+                )
+            ],
+            active_time_sources=[
+                queries.ActiveTimeSource(
+                    "afk",
+                    [f"aw-watcher-afk_{hostname}"],
+                    host=hostname,
+                )
+            ],
+            active_time_rule={
+                "type": "regex",
+                "source": "afk",
+                "field": "status",
+                "regex": "^not-afk$",
+            },
+            category_specs=_source_qualified_category_specs(classes),
+            capabilities=capabilities,
+        )
+        return queries.canonicalEventsV2(params), True
+
+    missing = sorted(_SOURCE_ONLY_QUERY_CAPABILITIES.difference(capabilities))
+    logger.warning(
+        "Server lacks source-only canonical query capabilities (%s); using the "
+        "legacy currentwindow/AFK compatibility fallback",
+        ", ".join(missing),
+    )
+    return (
+        queries.canonicalEvents(
+            queries.DesktopQueryParams(
+                bid_window=f"aw-watcher-window_{hostname}",
+                bid_afk=f"aw-watcher-afk_{hostname}",
+                classes=classes,
+            )
+        ),
+        False,
+    )
+
+
+def _report_query(canonical_query: str, app_field: str, title_field: str) -> str:
+    return f"""
+    {canonical_query}
+    title_events = sort_by_duration(merge_events_by_keys(
+            events, ["{app_field}", "{title_field}"]));
+    app_events = sort_by_duration(merge_events_by_keys(
+            title_events, ["{app_field}"]));
+    cat_events = sort_by_duration(merge_events_by_keys(events, ["$category"]));
+    app_events = limit_events(app_events, {queries.default_limit});
+    title_events = limit_events(title_events, {queries.default_limit});
+    duration = sum_durations(events);
+    RETURN = {{
+            "events": events,
+            "window": {{
+                "app_events": app_events,
+                "title_events": title_events,
+                "cat_events": cat_events,
+                "active_events": not_afk,
+                "duration": duration
+            }},
+            "browser": {{
+                "domains": [],
+                "urls": [],
+                "duration": 0
+            }}
+    }};
+    """
+
+
 @main.command(help="Generate an activity report")
 @click.argument("hostname")
 @click.option("--cache", is_flag=True)
@@ -165,27 +284,25 @@ def report(
     limit: int = 10,
 ):
     logger.info(f"Querying between {start} and {stop}")
-    bid_window = f"aw-watcher-window_{hostname}"
-    bid_afk = f"aw-watcher-afk_{hostname}"
 
     if not start.tzinfo:
         start = start.astimezone()
     if not stop.tzinfo:
         stop = stop.astimezone()
 
-    bid_browsers: List[str] = []
-
     classes = get_classes()
-    params = queries.DesktopQueryParams(
-        bid_browsers=bid_browsers,
-        classes=classes,
-        filter_classes=[],
-        filter_afk=True,
-        include_audible=True,
-        bid_window=bid_window,
-        bid_afk=bid_afk,
+    canonical_query, uses_v2 = _canonical_query_for_capabilities(
+        hostname,
+        classes,
+        _server_capabilities(obj.client),
     )
-    query = queries.fullDesktopQuery(params)
+    app_field = _WINDOW_APP_FIELD if uses_v2 else "app"
+    title_field = _WINDOW_TITLE_FIELD if uses_v2 else "title"
+    query = _report_query(
+        canonical_query,
+        app_field,
+        title_field,
+    )
     logger.debug("Query: \n" + queries.pretty_query(query))
 
     result = obj.client.query(query, [(start, stop)], cache=cache, name=name)
@@ -204,12 +321,11 @@ def report(
         )
 
         title_events = _parse_events(period["window"]["title_events"])
-        print_top(title_events, lambda e: e.data["title"], title="Titles", n=limit)
+        print_top(title_events, lambda e: e.data[title_field], title="Titles", n=limit)
 
-        active_events = _parse_events(period["window"]["title_events"])
         print(
             "Total duration:\t",
-            sum((e.duration for e in active_events), timedelta()),
+            timedelta(seconds=period["window"]["duration"]),
         )
 
 
@@ -246,8 +362,6 @@ def canonical(
     name: Optional[str] = None,
 ):
     logger.info(f"Querying between {start} and {stop}")
-    bid_window = f"aw-watcher-window_{hostname}"
-    bid_afk = f"aw-watcher-afk_{hostname}"
 
     if not start.tzinfo:
         start = start.astimezone()
@@ -256,12 +370,10 @@ def canonical(
 
     classes = default_classes
 
-    query = queries.canonicalEvents(
-        queries.DesktopQueryParams(
-            bid_window=bid_window,
-            bid_afk=bid_afk,
-            classes=classes,
-        )
+    query, uses_v2 = _canonical_query_for_capabilities(
+        hostname,
+        classes,
+        _server_capabilities(obj.client),
     )
     query = f"""{query}\n RETURN = events;"""
     logger.debug("Query: \n" + queries.pretty_query(query))
@@ -280,7 +392,8 @@ def canonical(
                     (
                         str(e.timestamp).split(".")[0],
                         str(e.duration).split(".")[0],
-                        f'[{e.data["app"]}] {textwrap.shorten(e.data["title"], 60, placeholder="...")}',
+                        f'[{e.data[_WINDOW_APP_FIELD if uses_v2 else "app"]}] '
+                        f'{textwrap.shorten(e.data[_WINDOW_TITLE_FIELD if uses_v2 else "title"], 60, placeholder="...")}',
                     )
                     for e in events[-10:]
                 ],

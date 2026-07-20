@@ -13,11 +13,13 @@ from aw_client.queries import (
     ActivityCoverageSource,
     ActivitySource,
     AndroidQueryParams,
+    CanonicalQueryParamsV2,
     ContextSource,
     DesktopQueryParams,
     activeTimeQuery,
     activityQuery,
     canonicalEvents,
+    canonicalEventsV2,
     fullDesktopQuery,
     legacyActiveTimeQuery,
 )
@@ -1153,6 +1155,362 @@ def test_activity_coverage_keeps_all_overlapping_source_data_for_categories():
     assert result[1].duration == timedelta(seconds=20)
     assert result[1].data["$source.meeting.subject"] == "Planning"
     assert "$source.desktop.vdesktop" not in result[1].data
+
+
+def test_canonical_events_v2_meeting_only_needs_no_window_or_afk():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    meeting = datastore.create_bucket(
+        bucket_id="meeting-v2",
+        type="meeting",
+        client="test",
+        hostname="test",
+        name="meeting",
+    )
+    meeting.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=20),
+            data={"provider": "Teams", "subject": "Planning"},
+        )
+    )
+
+    generated = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "meeting",
+                    ["meeting-v2"],
+                    ["provider", "subject"],
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    )
+    result = query(
+        "canonical-v2-meeting-only",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert "find_bucket" not in generated
+    assert len(result) == 1
+    assert result[0].data == {
+        "$source.meeting.provider": "Teams",
+        "$source.meeting.subject": "Planning",
+    }
+
+
+def test_canonical_events_v2_stopwatch_label_creates_namespaced_coverage():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    stopwatch = datastore.create_bucket(
+        bucket_id="stopwatch-v2",
+        type="stopwatch",
+        client="test",
+        hostname="test",
+        name="stopwatch",
+    )
+    stopwatch.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=15),
+            data={"label": "Write release notes"},
+        )
+    )
+
+    generated = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "stopwatch",
+                    ["stopwatch-v2"],
+                    ["label"],
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    )
+    result = query(
+        "canonical-v2-stopwatch",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert len(result) == 1
+    assert result[0].data == {
+        "$source.stopwatch.label": "Write release notes",
+    }
+
+
+def test_canonical_events_v2_ignores_unreferenced_currentwindow_bucket():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    window = datastore.create_bucket(
+        bucket_id="unreferenced-window-v2",
+        type="currentwindow",
+        client="test",
+        hostname="test",
+        name="window",
+    )
+    meeting = datastore.create_bucket(
+        bucket_id="referenced-meeting-v2",
+        type="meeting",
+        client="test",
+        hostname="test",
+        name="meeting",
+    )
+    window.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=40),
+            data={"app": "Editor", "title": "Secret window title"},
+        )
+    )
+    meeting.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=10),
+            data={"subject": "Planning"},
+        )
+    )
+
+    generated = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "meeting",
+                    ["referenced-meeting-v2"],
+                    ["subject"],
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    )
+    result = query(
+        "canonical-v2-unreferenced-window",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert "unreferenced-window-v2" not in generated
+    assert len(result) == 1
+    assert result[0].duration == timedelta(seconds=10)
+    assert result[0].data == {"$source.meeting.subject": "Planning"}
+
+
+def test_canonical_events_v2_explicit_window_source_is_namespaced_only():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    window = datastore.create_bucket(
+        bucket_id="explicit-window-v2",
+        type="currentwindow",
+        client="test",
+        hostname="test",
+        name="window",
+    )
+    window.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=20),
+            data={"app": "Editor", "title": "Code"},
+        )
+    )
+
+    generated = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "window",
+                    ["explicit-window-v2"],
+                    ["app", "title"],
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    )
+    result = query(
+        "canonical-v2-explicit-window",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert len(result) == 1
+    assert result[0].data == {
+        "$source.window.app": "Editor",
+        "$source.window.title": "Code",
+    }
+
+
+@pytest.mark.parametrize("source_role", ["context", "active"])
+def test_canonical_events_v2_non_coverage_sources_cannot_create_coverage(source_role):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(minutes=1)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    source = datastore.create_bucket(
+        bucket_id=f"{source_role}-only-v2",
+        type=source_role,
+        client="test",
+        hostname="test",
+        name=source_role,
+    )
+    source.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=20),
+            data={"state": "present"},
+        )
+    )
+
+    if source_role == "context":
+        params = CanonicalQueryParamsV2(
+            context_sources=[
+                ContextSource(
+                    "context",
+                    ["context-only-v2"],
+                    ["state"],
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    else:
+        params = CanonicalQueryParamsV2(
+            active_time_sources=[
+                ActiveTimeSource(
+                    "active",
+                    ["active-only-v2"],
+                    scope="global",
+                )
+            ],
+            active_time_rule={
+                "type": "regex",
+                "source": "active",
+                "field": "state",
+                "regex": "present",
+            },
+            capabilities=["query.active_periods_v2.v1"],
+        )
+
+    generated = canonicalEventsV2(params)
+    result = query(
+        f"canonical-v2-{source_role}-only",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert result == []
+
+
+@pytest.mark.parametrize(
+    "legacy_field",
+    [
+        "bid_window",
+        "bid_afk",
+        "bid_browsers",
+        "bid_stopwatch",
+        "always_active_pattern",
+        "legacy_window_mode",
+        "legacy_window_fields",
+        "activity_sources",
+        "background_sources",
+    ],
+)
+def test_canonical_query_params_v2_rejects_legacy_fields(legacy_field):
+    with pytest.raises(TypeError, match="unexpected keyword argument"):
+        CanonicalQueryParamsV2(**{legacy_field: object()})
+
+
+def test_canonical_events_v2_does_not_accept_root_field_injection():
+    parameter_names = set(inspect.signature(CanonicalQueryParamsV2).parameters)
+
+    assert parameter_names == {
+        "activity_coverage_sources",
+        "active_time_sources",
+        "active_time_rule",
+        "context_sources",
+        "category_specs",
+        "hostname",
+        "capabilities",
+    }
+    with pytest.raises(TypeError, match="unexpected keyword argument 'bid_window'"):
+        canonicalEventsV2(CanonicalQueryParamsV2(), bid_window="unrelated")
+
+
+def test_canonical_events_v2_rejects_duplicate_fact_source_ids_across_roles():
+    with pytest.raises(ValueError, match="unique across coverage and context"):
+        canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                activity_coverage_sources=[
+                    ActivityCoverageSource(
+                        "shared",
+                        ["coverage"],
+                        ["title"],
+                        scope="global",
+                    )
+                ],
+                context_sources=[
+                    ContextSource(
+                        "shared",
+                        ["context"],
+                        ["project"],
+                        scope="global",
+                    )
+                ],
+                capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            )
+        )
+
+
+def test_canonical_events_v2_rejects_duplicate_active_time_source_ids():
+    with pytest.raises(ValueError, match="active-time source ids must be unique"):
+        canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                active_time_sources=[
+                    ActiveTimeSource("duplicate", ["one"], scope="global"),
+                    ActiveTimeSource("duplicate", ["two"], scope="global"),
+                ],
+                active_time_rule={"type": "none"},
+                capabilities=["query.active_periods_v2.v1"],
+            )
+        )
+
+
+def test_canonical_events_v2_normalizes_empty_bucket_host_map():
+    query_text = canonicalEventsV2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "meeting",
+                    ["meeting"],
+                    ["subject"],
+                    bucket_hosts={},
+                    scope="global",
+                )
+            ],
+            capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+        )
+    )
+
+    assert 'query_bucket_optional("meeting")' in query_text
 
 
 def test_full_desktop_query_accepts_alternative_activity_without_window():
