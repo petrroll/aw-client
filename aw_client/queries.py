@@ -4,6 +4,7 @@ Common queries.
 Most of these are from: https://github.com/ActivityWatch/aw-webui/blob/master/src/queries.ts
 """
 
+import copy
 import dataclasses
 import json
 import re
@@ -15,6 +16,7 @@ from typing import (
     List,
     Literal,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -23,7 +25,7 @@ from typing_extensions import TypeGuard
 
 import aw_client
 
-from .classes import get_classes
+from .classes import default_classes
 
 
 class EnhancedJSONEncoder(json.JSONEncoder):
@@ -50,6 +52,7 @@ class ContextSource:
     host: Optional[str] = None
     bucket_hosts: Optional[Dict[str, str]] = None
     scope: Optional[Literal["host", "global"]] = None
+    interval_policy: Literal["exact", "heartbeat"] = "exact"
 
 
 @dataclass
@@ -59,6 +62,7 @@ class ActiveTimeSource:
     host: Optional[str] = None
     bucket_hosts: Optional[Dict[str, str]] = None
     scope: Optional[Literal["host", "global"]] = None
+    interval_policy: Literal["exact", "heartbeat"] = "exact"
 
 
 @dataclass
@@ -69,6 +73,7 @@ class ActivitySource:
     host: Optional[str] = None
     bucket_hosts: Optional[Dict[str, str]] = None
     scope: Optional[Literal["host", "global"]] = None
+    interval_policy: Literal["exact", "heartbeat"] = "exact"
 
 
 @dataclass
@@ -80,6 +85,7 @@ class ActivityCoverageSource:
     bucket_hosts: Optional[Dict[str, str]] = None
     scope: Optional[Literal["host", "global"]] = None
     keeps_active: bool = False
+    interval_policy: Literal["exact", "heartbeat"] = "exact"
 
 
 @dataclass
@@ -95,6 +101,18 @@ class CanonicalQueryParamsV2:
     category_specs: Optional[List[Dict[str, Any]]] = None
     hostname: Optional[str] = None
     capabilities: List[str] = field(default_factory=list)
+    filter_afk: bool = True
+    filter_categories: Optional[List[List[str]]] = None
+    explain_categories: bool = False
+
+
+@dataclass
+class _CurrentPipelineInternals:
+    """Private compatibility hooks which never widen the public raw-source API."""
+
+    bucket_expressions: Dict[str, List[str]] = field(default_factory=dict)
+    active_aliases: Dict[str, str] = field(default_factory=dict)
+    auxiliary_sources: List[ActiveTimeSource] = field(default_factory=list)
 
 
 @dataclass
@@ -156,26 +174,28 @@ def isAndroidParams(params: QueryParams) -> TypeGuard[AndroidQueryParams]:
     return isinstance(params, AndroidQueryParams)
 
 
-def resolveActivityProfile(
-    params: Union[DesktopQueryParams, AndroidQueryParams],
-) -> str:
-    if params.hostname == "":
-        raise ValueError("hostname must be non-empty")
-    if not isDesktopParams(params) and params.active_time_rule:
+def _legacy_selector_expression(bucket_id: str, hostname: Optional[str]) -> str:
+    arguments = [_serialize_bucket_id(bucket_id)]
+    if hostname:
+        arguments.append(_serialize_query_json(hostname))
+    return f"find_bucket({', '.join(arguments)})"
+
+
+def _adapt_desktop_to_current_v2(params: DesktopQueryParams) -> str:
+    if params.activity_sources or params.background_sources:
         raise ValueError(
-            "active-time expressions are only supported for desktop queries"
+            "replacement/background source semantics are legacy-v1 only; use explicit "
+            "coverage/context roles on current servers"
         )
-    if not isDesktopParams(params) and params.activity_sources:
+    coverage = list(params.activity_coverage_sources)
+    context = list(params.context_sources)
+    internals = _CurrentPipelineInternals()
+    projection_source = None
+    projection_variable = "events"
+    if params.legacy_window_mode == "none" and params.always_active_pattern:
         raise ValueError(
-            "replacement activity sources are only supported for desktop queries"
-        )
-    if not isDesktopParams(params) and params.background_sources:
-        raise ValueError(
-            "background activity sources are only supported for desktop queries"
-        )
-    if not isDesktopParams(params) and params.activity_coverage_sources:
-        raise ValueError(
-            "activity coverage sources are only supported for desktop queries"
+            "always_active_pattern requires a legacy window projection; "
+            "legacy_window_mode='none' is unsupported"
         )
     if (
         params.category_specs is not None
@@ -184,212 +204,246 @@ def resolveActivityProfile(
         raise ValueError(
             "flexible categorization requires server capability query.categorize_v2.v1"
         )
-    if (
-        (params.context_sources or params.activity_coverage_sources)
-        and "query.merge_subwatcher_fields.source_namespace.v1"
-        not in params.capabilities
-    ):
-        raise ValueError(
-            "context enrichment requires server capability "
-            "query.merge_subwatcher_fields.source_namespace.v1"
-        )
-    if (
-        isDesktopParams(params)
-        and params.active_time_rule
-        and "query.active_periods_v2.v1" not in params.capabilities
-    ):
-        raise ValueError(
-            "active-time expressions require server capability "
-            "query.active_periods_v2.v1"
-        )
-    if (
-        params.activity_sources or params.background_sources
-    ) and "query.map_event_fields.v1" not in params.capabilities:
-        raise ValueError(
-            "activity sources require server capability query.map_event_fields.v1"
-        )
-    if isDesktopParams(params):
-        supports_source_namespace = (
-            "query.merge_subwatcher_fields.source_namespace.v1" in params.capabilities
-        )
-        if params.legacy_window_mode not in ("activity", "context", "none"):
-            raise ValueError(
-                "legacy_window_mode must be 'activity', 'context', or 'none'"
-            )
-        if (
-            params.legacy_window_mode == "context"
-            and params.bid_window
-            and not supports_source_namespace
-        ):
-            raise ValueError(
-                "legacy window context requires server capability "
-                "query.merge_subwatcher_fields.source_namespace.v1"
-            )
-        if params.bid_window == "":
-            raise ValueError("bid_window must be non-empty when supplied")
-        if params.bid_afk == "":
-            raise ValueError("bid_afk must be non-empty when supplied")
-        if params.always_active_pattern and not params.bid_afk:
-            raise ValueError("always_active_pattern requires bid_afk")
-        if (
-            params.background_sources
-            and not params.active_time_rule
-            and not params.bid_afk
-        ):
-            raise ValueError(
-                "background activity sources require bid_afk or an active-time "
-                "expression"
-            )
-        if (
-            params.filter_afk
-            and (
-                params.bid_window
-                or params.activity_coverage_sources
-                or params.activity_sources
-            )
-            and not params.active_time_rule
-            and not params.bid_afk
-        ):
-            raise ValueError(
-                "AFK filtering requires bid_afk or an active-time expression"
-            )
+    if params.bid_window and params.legacy_window_mode != "none":
+        projection_source = "legacy_window"
+        common = {
+            "source_id": projection_source,
+            "bucket_ids": [params.bid_window],
+            "fields": list(params.legacy_window_fields),
+            "host": params.hostname,
+            "scope": "host" if params.hostname else "global",
+            "interval_policy": "heartbeat",
+        }
+        internals.bucket_expressions[projection_source] = [
+            _legacy_selector_expression(params.bid_window, params.hostname)
+        ]
+        if params.legacy_window_mode == "activity":
+            coverage.insert(0, ActivityCoverageSource(**common))
+            projection_variable = "coverage_source_0"
+        else:
+            context.insert(0, ContextSource(**common))
+            projection_variable = "context_source_0"
 
-    if params.category_specs is None and not params.classes:
-        # if categories not explicitly set,
-        # get categories from server settings
-        params.classes = get_classes()
+    has_custom_active_rule = params.active_time_rule is not None
+    active_rule = params.active_time_rule
+    active_sources = list(params.active_time_sources)
+    if active_rule is None and params.bid_afk:
+        active_sources = [
+            ActiveTimeSource(
+                "legacy_afk",
+                [params.bid_afk],
+                host=params.hostname,
+                scope="host" if params.hostname else "global",
+                interval_policy="heartbeat",
+            )
+        ]
+        internals.bucket_expressions["legacy_afk"] = [
+            _legacy_selector_expression(params.bid_afk, params.hostname)
+        ]
+        branches: List[Dict[str, Any]] = [
+            {
+                "type": "regex",
+                "source": "legacy_afk",
+                "field": "status",
+                "regex": "^not-afk$",
+            }
+        ]
+        if params.always_active_pattern and projection_source and params.bid_window:
+            active_sources.append(
+                ActiveTimeSource(
+                    projection_source,
+                    [params.bid_window],
+                    host=params.hostname,
+                    scope="host" if params.hostname else "global",
+                    interval_policy="heartbeat",
+                )
+            )
+            # Reuse the already-loaded window facts for always-active matching.
+            internals.active_aliases[projection_source] = projection_variable
+            window_rules = [
+                {
+                    "type": "regex",
+                    "source": projection_source,
+                    "field": field,
+                    "regex": params.always_active_pattern,
+                }
+                for field in params.legacy_window_fields
+                if field in ("app", "title")
+            ]
+            if window_rules:
+                branches.append(
+                    window_rules[0]
+                    if len(window_rules) == 1
+                    else {"type": "any", "rules": window_rules}
+                )
+        active_rule = (
+            branches[0] if len(branches) == 1 else {"type": "any", "rules": branches}
+        )
 
-    # Query2 strings preserve raw backslashes instead of decoding JSON escapes.
-    classes_str = _serialize_query_json(params.classes)
-    category_specs_str = _serialize_query_json(params.category_specs or [])
-    has_active_time_rule = isDesktopParams(params) and bool(params.active_time_rule)
-    enforce_source_hostname = (
-        "query.query_bucket_optional.expected_hostname.v1" in params.capabilities
+    browser_streams: List[Tuple[str, str]] = []
+    browser_sources = current_browser_families(params.bid_browsers)
+    audible_enabled = (
+        params.include_audible
+        and not has_custom_active_rule
+        and active_rule is not None
+        and projection_source is not None
     )
-
-    cat_filter_str = _serialize_query_json(params.filter_classes)
-
-    if isDesktopParams(params):
-        activity_code = _legacy_activity_events(
-            params.bid_window,
-            params.hostname,
-            params.legacy_window_mode,
-            supports_source_namespace,
+    audible_rules: List[Dict[str, Any]] = []
+    for browser_name, family_bucket_ids in browser_sources:
+        source_id = f"legacy_browser_{browser_name}"
+        source = ActiveTimeSource(
+            source_id,
+            family_bucket_ids,
+            scope="global",
+            interval_policy="heartbeat",
         )
-        if has_active_time_rule:
-            active_code = activeTimeEvents(params)
-        elif params.bid_afk:
-            active_code = _legacy_active_time_events(
-                params.bid_afk,
-                params.hostname,
-                params.always_active_pattern,
+        if audible_enabled:
+            active_index = len(active_sources)
+            active_sources.append(source)
+            browser_streams.append((browser_name, f"active_source_{active_index}"))
+            focus_rule = current_browser_focus_rule(projection_source, browser_name)
+            audible_rules.append(
+                {
+                    "type": "all",
+                    "rules": [
+                        {
+                            "type": "regex",
+                            "source": source_id,
+                            "field": "audible",
+                            "regex": "^true$",
+                            "value_mode": "scalar",
+                        },
+                        focus_rule,
+                    ],
+                }
             )
         else:
-            active_code = "not_afk = [];"
-        browser_code = (
-            browserEvents(params)
-            + (
-                """
-            audible_events = filter_keyvals(browser_events, "audible", [true]);
-            not_afk = period_union(not_afk, audible_events);
-            """
-                if params.include_audible and not has_active_time_rule
-                else ""
+            auxiliary_index = len(internals.auxiliary_sources)
+            internals.auxiliary_sources.append(source)
+            browser_streams.append((browser_name, f"auxiliary_source_{auxiliary_index}"))
+
+    if audible_rules:
+        assert projection_source is not None
+        if all(source.source_id != projection_source for source in active_sources):
+            active_sources.append(
+                ActiveTimeSource(
+                    projection_source,
+                    [params.bid_window],
+                    host=params.hostname,
+                    scope="host" if params.hostname else "global",
+                    interval_policy="heartbeat",
+                )
             )
-            if params.bid_browsers
-            else ""
+            internals.active_aliases[projection_source] = projection_variable
+        active_rule = {"type": "any", "rules": [active_rule, *audible_rules]}
+
+    query = _canonical_source_pipeline_v2(
+        CanonicalQueryParamsV2(
+            activity_coverage_sources=coverage,
+            active_time_sources=active_sources,
+            active_time_rule=active_rule,
+            context_sources=context,
+            category_specs=None,
+            hostname=params.hostname,
+            capabilities=params.capabilities,
+            filter_afk=params.filter_afk and bool(coverage),
+            filter_categories=None,
+        ),
+        internals,
+    )
+    if projection_source:
+        source_variable = projection_variable
+        # Project the old root-field shape from the already loaded source. The
+        # period reset removes v2 namespace fields without a second bucket read.
+        query += (
+            "\nevents = period_union([], events);"
+            "\nevents = merge_subwatcher_fields(events, "
+            f"{source_variable}, {_serialize_query_json(params.legacy_window_fields)});"
         )
-        platform_code = "\n".join(
-            [
-                activity_code,
-                activityCoverageEvents(
-                    params.activity_coverage_sources,
-                    params.hostname,
-                    enforce_source_hostname,
-                ),
-                (
-                    "events = merge_subwatcher_fields("
-                    "events, legacy_activity, "
-                    f"{_serialize_query_json(params.legacy_window_fields)});"
-                    if (
-                        params.bid_window
-                        and params.legacy_window_mode != "none"
-                        and supports_source_namespace
-                    )
-                    else ""
-                ),
-                activityEvents(
-                    params.activity_sources,
-                    False,
-                    params.hostname,
-                    enforce_source_hostname,
-                ),
-                active_code,
-                browser_code,
-                (
-                    activityCoverageActiveOverrides(
-                        params.activity_coverage_sources
-                    )
-                    if params.filter_afk
-                    else ""
-                ),
-                (
-                    "events = filter_period_intersect(events, not_afk);"
-                    if params.filter_afk
-                    else ""
-                ),
-                backgroundActivityEvents(
-                    params.background_sources,
-                    params.hostname,
-                    enforce_source_hostname,
-                ),
-            ]
+        coverage_offset = 1 if params.legacy_window_mode == "activity" else 0
+        for index, source in enumerate(
+            params.activity_coverage_sources, start=coverage_offset
+        ):
+            query += (
+                "\nevents = merge_subwatcher_fields(events, "
+                f"coverage_source_{index}, {_serialize_query_json(source.fields)}, "
+                f"{_serialize_query_json({'source_id': source.source_id, 'conflict': 'base_wins'})});"
+            )
+        context_offset = 1 if params.legacy_window_mode == "context" else 0
+        for index, source in enumerate(params.context_sources, start=context_offset):
+            query += (
+                "\nevents = merge_subwatcher_fields(events, "
+                f"context_source_{index}, {_serialize_query_json(source.fields)}, "
+                f"{_serialize_query_json({'source_id': source.source_id, 'conflict': source.conflict})});"
+            )
+        if params.category_specs is not None:
+            query += (
+                "\nevents = merge_subwatcher_fields(events, "
+                f"{source_variable}, {_serialize_query_json(params.legacy_window_fields)}, "
+                f"{_serialize_query_json({'source_id': projection_source, 'conflict': 'base_wins'})});"
+            )
+
+    if params.category_specs is not None:
+        query += (
+            "\nevents = categorize_v2(events, "
+            f"{_serialize_query_json(semantic_category_specs(params.category_specs))}"
+            + (f", {_serialize_query_json(params.hostname)}" if params.hostname else "")
+            + ");"
         )
-    else:
-        assert isAndroidParams(params)
-        platform_code = "\n".join(
-            [
-                (
-                    "events = flood(query_bucket(find_bucket("
-                    f"{_serialize_bucket_id(params.bid_android)}"
-                    + (
-                        f", {_serialize_query_json(params.hostname)}"
-                        if params.hostname
-                        else ""
-                    )
-                    + ")));"
-                ),
-            ]
+    elif params.classes:
+        query += f"\nevents = categorize(events, {_serialize_query_json(params.classes)});"
+    if params.filter_classes:
+        query += (
+            '\nevents = filter_keyvals(events, "$category", '
+            f"{_serialize_query_json(params.filter_classes)});"
         )
 
-    return "\n".join(
-        [
-            platform_code,
-            contextEvents(
-                params.context_sources, params.hostname, enforce_source_hostname
-            ),
-            (
-                f"events = categorize_v2(events, {category_specs_str}"
-                + (
-                    f", {_serialize_query_json(params.hostname)}"
-                    if params.hostname
-                    else ""
-                )
-                + ");"
-                if params.category_specs is not None
-                else (
-                    f"events = categorize(events, {classes_str});"
-                    if params.classes
-                    else ""
-                )
-            ),
-            (
-                f'events = filter_keyvals(events, "$category", {cat_filter_str});'
-                if params.filter_classes
-                else ""
-            ),
-        ]
+    query += "\nbrowser_events = [];"
+    for browser_name, variable in browser_streams:
+        if projection_source is None:
+            continue
+        focus_rule = current_browser_focus_rule(projection_source, browser_name)
+        browser_fields = ["url", "title", "audible", "incognito", "tabCount"]
+        query += (
+            f"\nbrowser_focus_{browser_name} = active_periods_v2("
+            f"[[{_serialize_query_json(projection_source)}, {projection_variable}]], "
+            f"{_serialize_query_json(focus_rule)});"
+            f"\nbrowser_facts_{browser_name} = merge_subwatcher_fields("
+            f"{variable}, [], {_serialize_query_json(browser_fields)});"
+            f"\nbrowser_presence_{browser_name} = period_union({variable}, []);"
+            f"\nbrowser_presence_{browser_name} = filter_period_intersect("
+            f"browser_presence_{browser_name}, browser_focus_{browser_name});"
+            f"\nbrowser_resolved_{browser_name} = merge_subwatcher_fields("
+            f"browser_presence_{browser_name}, browser_facts_{browser_name}, "
+            f"{_serialize_query_json(browser_fields)});"
+            f"\nbrowser_{browser_name} = split_url_events(browser_resolved_{browser_name});"
+            f"\nbrowser_events = concat(browser_events, browser_{browser_name});"
+        )
+    if browser_streams:
+        query += (
+            "\nbrowser_events = sort_by_timestamp(browser_events);"
+            "\nbrowser_events = filter_period_intersect(browser_events, query_window);"
+            # Derived report output cannot escape selected canonical activity.
+            "\nbrowser_events = filter_period_intersect(browser_events, events);"
+        )
+    return query
+
+
+def resolveActivityProfile(
+    params: Union[DesktopQueryParams, AndroidQueryParams],
+) -> str:
+    """Translate a legacy desktop signature into the current source pipeline."""
+    if not isDesktopParams(params):
+        raise ValueError(
+            "Android grammar is legacy-v1 only; use aw_client.legacy_v1 explicitly"
+        )
+    params = dataclasses.replace(params)
+    params.capabilities = sorted(
+        CURRENT_QUERY_CAPABILITIES.union(params.capabilities)
     )
+    if params.category_specs is None and not params.classes:
+        params.classes = copy.deepcopy(default_classes)
+    return _adapt_desktop_to_current_v2(params)
 
 
 def canonicalEvents(params: Union[DesktopQueryParams, AndroidQueryParams]) -> str:
@@ -397,149 +451,351 @@ def canonicalEvents(params: Union[DesktopQueryParams, AndroidQueryParams]) -> st
     return resolveActivityProfile(params)
 
 
-def canonicalEventsV2(params: CanonicalQueryParamsV2) -> str:
-    """Build canonical events exclusively from explicitly named source roles."""
+CURRENT_QUERY_CAPABILITIES = {
+    "query.query_bucket_optional_raw.v1",
+    "query.query_period.v1",
+    "query.flood_v2.v1",
+    "query.merge_subwatcher_fields.source_namespace.v1",
+    "query.active_periods_v2.v1",
+    "query.categorize_v2.v1",
+}
+
+
+def _validate_interval_policy(source: Any, source_kind: str) -> None:
+    if source.interval_policy not in ("exact", "heartbeat"):
+        raise ValueError(f"{source_kind} interval_policy must be 'exact' or 'heartbeat'")
+
+
+def _raw_source_events(
+    variable: str,
+    source: Any,
+    hostname: Optional[str],
+    source_kind: str,
+    bucket_expressions: Optional[List[str]] = None,
+) -> str:
+    """Load competing source facts without clipping them to the query interval."""
+    _validate_interval_policy(source, source_kind)
+    bucket_ids = _source_bucket_ids(
+        source.bucket_ids,
+        source.host,
+        source.bucket_hosts,
+        source.scope,
+        hostname,
+        source_kind,
+    )
+    if bucket_expressions is not None and len(bucket_expressions) != len(source.bucket_ids):
+        raise ValueError("internal bucket selector count does not match source bucket ids")
+    expression_by_id = dict(zip(source.bucket_ids, bucket_expressions or []))
+    expected_hostname = _expected_source_hostname(source.scope, hostname, True)
+    raw = f"{variable}_raw"
+    lines = [f"{raw} = [];"]
+    for bucket_id in bucket_ids:
+        arguments = [expression_by_id.get(bucket_id, _serialize_bucket_id(bucket_id))]
+        if expected_hostname:
+            arguments.append(_serialize_query_json(expected_hostname))
+        elif source.interval_policy == "heartbeat":
+            arguments.append("null")
+        if source.interval_policy == "heartbeat":
+            arguments.append("5")
+        lines.append(
+            f"{raw} = concat({raw}, query_bucket_optional_raw("
+            f"{', '.join(arguments)}));"
+        )
+    if source.interval_policy == "heartbeat":
+        lines.append(f"{variable} = flood_v2({raw});")
+    else:
+        lines.append(f"{variable} = {raw};")
+    return "\n".join(lines)
+
+
+def _canonical_source_pipeline_v2(
+    params: CanonicalQueryParamsV2,
+    internals: Optional[_CurrentPipelineInternals] = None,
+) -> str:
+    """The sole current-server pipeline used by native Python query builders."""
+    internals = internals or _CurrentPipelineInternals()
     if params.hostname == "":
         raise ValueError("hostname must be non-empty")
     if params.active_time_rule is None and params.active_time_sources:
         raise ValueError("active-time sources require an active-time rule")
-    if (
-        params.category_specs is not None
-        and "query.categorize_v2.v1" not in params.capabilities
-    ):
+    if params.category_specs is not None and "query.categorize_v2.v1" not in params.capabilities:
         raise ValueError(
             "flexible categorization requires server capability query.categorize_v2.v1"
         )
-    if (
-        (params.context_sources or params.activity_coverage_sources)
-        and "query.merge_subwatcher_fields.source_namespace.v1"
-        not in params.capabilities
-    ):
+    if params.explain_categories and "query.categorize_v2_explain.v1" not in params.capabilities:
         raise ValueError(
-            "context enrichment requires server capability "
-            "query.merge_subwatcher_fields.source_namespace.v1"
-        )
-    if (
-        params.active_time_rule is not None
-        and "query.active_periods_v2.v1" not in params.capabilities
-    ):
-        raise ValueError(
-            "active-time expressions require server capability "
-            "query.active_periods_v2.v1"
-        )
-    fact_source_ids = [
-        source.source_id
-        for source in [*params.activity_coverage_sources, *params.context_sources]
-    ]
-    if len(fact_source_ids) != len(set(fact_source_ids)):
-        raise ValueError(
-            "canonical fact source ids must be unique across coverage and context"
+            "category explanations require server capability "
+            "query.categorize_v2_explain.v1"
         )
 
-    enforce_source_hostname = (
-        "query.query_bucket_optional.expected_hostname.v1" in params.capabilities
-    )
-    code = [
-        "events = [];",
-        activityCoverageEvents(
-            params.activity_coverage_sources,
-            params.hostname,
-            enforce_source_hostname,
-        ),
-    ]
+    fact_sources = [*params.activity_coverage_sources, *params.context_sources]
+    fact_source_ids = [source.source_id for source in fact_sources]
+    if len(fact_source_ids) != len(set(fact_source_ids)):
+        raise ValueError("canonical fact source ids must be unique across coverage and context")
+    _validate_unique_source_ids(params.active_time_sources, "active-time")
+    missing_active_sources = _active_time_rule_source_ids(params.active_time_rule) - {
+        source.source_id for source in params.active_time_sources
+    }
+    if missing_active_sources:
+        raise ValueError(
+            "active-time rule references unknown source(s): "
+            + ", ".join(sorted(missing_active_sources))
+        )
+    has_keeps_active = any(source.keeps_active for source in params.activity_coverage_sources)
+    if params.filter_afk and params.active_time_rule is None and not has_keeps_active:
+        raise ValueError(
+            "active filtering requires an active-time rule or keeps_active coverage"
+        )
+
+    code = ["query_window = query_period();", "coverage = [];"]
+    # Load all source facts first. The raw primitive intentionally retains the
+    # original event bounds around the interval; only derived coverage is clipped.
+    for index, source in enumerate(params.activity_coverage_sources):
+        if not source.fields:
+            raise ValueError("activity coverage source must contain at least one field")
+        variable = f"coverage_source_{index}"
+        code.append(
+            _raw_source_events(
+                variable,
+                source,
+                params.hostname,
+                "activity coverage",
+                internals.bucket_expressions.get(source.source_id),
+            )
+        )
+        code.append(
+            f"coverage_period_{index} = filter_period_intersect({variable}, query_window);"
+        )
+        code.append(f"coverage = period_union(coverage, coverage_period_{index});")
+    for index, source in enumerate(params.context_sources):
+        if not source.fields:
+            raise ValueError("context source must contain at least one field")
+        code.append(
+            _raw_source_events(
+                f"context_source_{index}",
+                source,
+                params.hostname,
+                "context",
+                internals.bucket_expressions.get(source.source_id),
+            )
+        )
+    for index, source in enumerate(params.active_time_sources):
+        variable = f"active_source_{index}"
+        alias = internals.active_aliases.get(source.source_id)
+        code.append(
+            f"{variable} = {alias};"
+            if alias
+            else _raw_source_events(
+                variable,
+                source,
+                params.hostname,
+                "active-time",
+                internals.bucket_expressions.get(source.source_id),
+            )
+        )
+    for index, source in enumerate(internals.auxiliary_sources):
+        code.append(
+            _raw_source_events(
+                f"auxiliary_source_{index}",
+                source,
+                params.hostname,
+                "legacy auxiliary",
+                internals.bucket_expressions.get(source.source_id),
+            )
+        )
+
+    code.extend(["coverage = filter_period_intersect(coverage, query_window);", "events = coverage;"])
+    # Enrich from competing source originals (or their deterministic heartbeat
+    # extension), never from a source union that discarded overlaps.
+    for index, source in enumerate(params.activity_coverage_sources):
+        code.append(
+            "events = merge_subwatcher_fields(events, "
+            f"coverage_source_{index}, {_serialize_query_json(source.fields)}, "
+            f"{_serialize_query_json({'source_id': source.source_id, 'conflict': 'base_wins'})});"
+        )
+    for index, source in enumerate(params.context_sources):
+        code.append(
+            "events = merge_subwatcher_fields(events, "
+            f"context_source_{index}, {_serialize_query_json(source.fields)}, "
+            f"{_serialize_query_json({'source_id': source.source_id, 'conflict': source.conflict})});"
+        )
+
     if params.active_time_rule is not None:
+        named = ", ".join(
+            f"[{_serialize_query_json(source.source_id)}, active_source_{index}]"
+            for index, source in enumerate(params.active_time_sources)
+        )
         code.extend(
             [
-                _active_time_events(
-                    params.active_time_sources,
-                    params.active_time_rule,
-                    params.hostname,
-                    enforce_source_hostname,
-                ),
-                activityCoverageActiveOverrides(
-                    params.activity_coverage_sources
-                ),
-                "events = filter_period_intersect(events, not_afk);",
+                f"active_time_sources = [{named}];",
+                f"active_time_rule = {_serialize_query_json(semantic_rule_expression(params.active_time_rule))};",
+                "not_afk = active_periods_v2(active_time_sources, active_time_rule"
+                + (f", {_serialize_query_json(params.hostname)}" if params.hostname else "")
+                + ");",
             ]
         )
-    code.append(
-        contextEvents(
-            params.context_sources,
-            params.hostname,
-            enforce_source_hostname,
-        )
-    )
+    else:
+        code.append("not_afk = [];")
+    for index, source in enumerate(params.activity_coverage_sources):
+        if source.keeps_active:
+            code.append(f"not_afk = period_union(not_afk, coverage_period_{index});")
+    # Normalize after every active contribution so adjacent winning-fact slices
+    # have one representation before they clip canonical events.
+    code.append("not_afk = period_union(not_afk, []);")
+    # The effective mask exists even for an unfiltered output and can never
+    # escape real source coverage or the requested query period.
+    code.append("not_afk = filter_period_intersect(not_afk, coverage);")
+    if params.filter_afk:
+        code.append("events = filter_period_intersect(events, not_afk);")
+
     if params.category_specs is not None:
-        category_specs = _serialize_query_json(params.category_specs)
-        hostname = (
-            f", {_serialize_query_json(params.hostname)}" if params.hostname else ""
+        function = "categorize_v2_explain" if params.explain_categories else "categorize_v2"
+        host = f", {_serialize_query_json(params.hostname)}" if params.hostname else ""
+        code.append(
+            f"events = {function}(events, {_serialize_query_json(semantic_category_specs(params.category_specs))}{host});"
         )
-        code.append(f"events = categorize_v2(events, {category_specs}{hostname});")
+    if params.filter_categories:
+        code.append(
+            'events = filter_keyvals(events, "$category", '
+            f"{_serialize_query_json(params.filter_categories)});"
+        )
     return "\n".join(code)
+
+
+def canonicalEventsV2(params: CanonicalQueryParamsV2) -> str:
+    """Build current-server canonical events from explicit source roles."""
+    return _canonical_source_pipeline_v2(params)
 
 
 def pretty_query(query: str) -> str:
     return "\n".join([line.strip() for line in query.split("\n") if line.strip()])
 
 
-def _legacy_bucket_query(bucket_id: str, hostname: Optional[str]) -> str:
-    hostname_arg = f", {_serialize_query_json(hostname)}" if hostname else ""
-    return (
-        f"query_bucket(find_bucket({_serialize_bucket_id(bucket_id)}"
-        f"{hostname_arg}))"
-    )
+def semantic_rule_expression(expression: Dict[str, Any]) -> Dict[str, Any]:
+    """Project a persisted expression to fields consumed by Query2 evaluators."""
+    kind = expression.get("type")
+    if kind is None and "regex" in expression:
+        kind = "regex"
+    if kind == "none":
+        return {"type": "none"}
+    if kind in ("all", "any"):
+        children = expression.get("rules", expression.get("children", []))
+        return {
+            "type": kind,
+            "rules": [semantic_rule_expression(child) for child in children],
+        }
+    if kind == "regex":
+        result = {"type": "regex", "regex": expression["regex"]}
+        for key in (
+            "source",
+            "host",
+            "ignore_case",
+            "negate",
+            "weight",
+            "value_mode",
+        ):
+            if key in expression:
+                result[key] = copy.deepcopy(expression[key])
+        for key in ("fields", "field", "select_keys"):
+            if key in expression:
+                result[key] = copy.deepcopy(expression[key])
+                break
+        return result
+    raise ValueError(f"unsupported rule expression type {kind!r}")
 
 
-def _legacy_activity_events(
-    bid_window: Optional[str],
-    hostname: Optional[str],
-    mode: Literal["activity", "context", "none"] = "activity",
-    supports_source_namespace: bool = False,
+def semantic_category_specs(
+    categories: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Project category documents to fields consumed by Query2 evaluators."""
+    result = []
+    for category in categories:
+        item = {
+            "name": copy.deepcopy(category["name"]),
+            "rule": semantic_rule_expression(category["rule"]),
+        }
+        if "id" in category:
+            item["id"] = category["id"]
+        for key in ("priority", "set_priority", "requires"):
+            if key in category:
+                item[key] = copy.deepcopy(category[key])
+        result.append(item)
+    return result
+
+
+# Frozen Query2 primitives used only by aw_client.legacy_v1 and raw compatibility APIs.
+# Frozen public helpers delegate to the explicit legacy target module.
+def contextEvents(
+    sources: List[ContextSource],
+    hostname: Optional[str] = None,
+    enforce_hostname: bool = False,
 ) -> str:
-    code = "events = [];"
-    if bid_window and mode != "none":
-        code += "\nlegacy_activity = flood("
-        code += f"{_legacy_bucket_query(bid_window, hostname)});\n"
-        if mode == "activity":
-            if supports_source_namespace:
-                code += (
-                    "legacy_activity_period = filter_period_intersect("
-                    "legacy_activity, legacy_activity);\n"
-                    "events = period_union(events, legacy_activity_period);"
-                )
-            else:
-                code += "events = legacy_activity;"
-    return code
+    from .legacy_v1 import contextEvents as build
+
+    return build(sources, hostname, enforce_hostname)
 
 
-def _legacy_active_time_events(
-    bid_afk: str,
-    hostname: Optional[str],
-    always_active_pattern: Optional[str] = None,
+def activityEvents(
+    sources: List[ActivitySource],
+    filter_afk: bool,
+    hostname: Optional[str] = None,
+    enforce_hostname: bool = False,
 ) -> str:
-    code = (
-        "not_afk = flood("
-        f"{_legacy_bucket_query(bid_afk, hostname)});\n"
-        'not_afk = filter_keyvals(not_afk, "status", ["not-afk"]);'
-    )
-    if always_active_pattern:
-        pattern = _serialize_query_json(always_active_pattern)
-        code += (
-            f'\nnot_treat_as_afk = filter_keyvals_regex(events, "app", {pattern});'
-            "\nnot_afk = period_union(not_afk, not_treat_as_afk);"
-            f'\nnot_treat_as_afk = filter_keyvals_regex(events, "title", {pattern});'
-            "\nnot_afk = period_union(not_afk, not_treat_as_afk);"
-        )
-    return code
+    from .legacy_v1 import activityEvents as build
+
+    return build(sources, filter_afk, hostname, enforce_hostname)
 
 
-def _optional_bucket_query(
-    bucket_id: str, expected_hostname: Optional[str] = None
+def activityCoverageEvents(
+    sources: List[ActivityCoverageSource],
+    hostname: Optional[str] = None,
+    enforce_hostname: bool = False,
 ) -> str:
-    hostname = (
-        f", {_serialize_query_json(expected_hostname)}" if expected_hostname else ""
-    )
-    return f"query_bucket_optional({_serialize_bucket_id(bucket_id)}{hostname})"
+    from .legacy_v1 import activityCoverageEvents as build
+
+    return build(sources, hostname, enforce_hostname)
+
+
+def activityCoverageActiveOverrides(
+    sources: List[ActivityCoverageSource],
+) -> str:
+    from .legacy_v1 import activityCoverageActiveOverrides as build
+
+    return build(sources)
+
+
+def backgroundActivityEvents(
+    sources: List[ActivitySource],
+    hostname: Optional[str] = None,
+    enforce_hostname: bool = False,
+) -> str:
+    from .legacy_v1 import backgroundActivityEvents as build
+
+    return build(sources, hostname, enforce_hostname)
+
+
+def activeTimeEvents(params: DesktopQueryParams) -> str:
+    from .legacy_v1 import activeTimeEvents as build
+
+    return build(params)
+
+
+def legacyActiveTimeQuery(bid_afk: str, hostname: Optional[str] = None) -> str:
+    from .legacy_v1 import legacyActiveTimeQuery as build
+
+    return build(bid_afk, hostname)
+
+
+def activityQuery(afk_buckets: List[str]) -> str:
+    from .legacy_v1 import activityQuery as build
+
+    return build(afk_buckets)
+
+
+def browserEvents(params: DesktopQueryParams) -> str:
+    from .legacy_v1 import browserEvents as build
+
+    return build(params)
 
 
 def _expected_source_hostname(
@@ -622,318 +878,77 @@ def _validate_unique_source_ids(sources: List[Any], source_kind: str) -> None:
         raise ValueError(f"{source_kind} source ids must be unique")
 
 
-def contextEvents(
-    sources: List[ContextSource],
-    hostname: Optional[str] = None,
-    enforce_hostname: bool = False,
-) -> str:
-    _validate_unique_source_ids(sources, "context")
-    code = ""
-    for index, source in enumerate(sources):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source.source_id):
-            raise ValueError(
-                "context source_id may only contain letters, numbers, '_' and '-'"
-            )
-        if not source.bucket_ids:
-            raise ValueError("context source must contain at least one bucket_id")
-        if not source.fields:
-            raise ValueError("context source must contain at least one field")
-        variable = f"context_{index}"
-        code += f"{variable} = [];\n"
-        bucket_ids = _source_bucket_ids(
-            source.bucket_ids,
-            source.host,
-            source.bucket_hosts,
-            source.scope,
-            hostname,
-            "context",
-        )
-        for bucket_id in bucket_ids:
-            code += (
-                f"{variable} = concat({variable}, "
-                f"flood({_optional_bucket_query(bucket_id, _expected_source_hostname(source.scope, hostname, enforce_hostname))}));\n"
-            )
-        code += f"{variable} = filter_period_intersect({variable}, events);\n"
-        options = _serialize_query_json(
-            {"source_id": source.source_id, "conflict": source.conflict}
-        )
-        fields = _serialize_query_json(source.fields)
-        fields_variable = f"context_fields_{index}"
-        options_variable = f"context_options_{index}"
-        code += (
-            f"{fields_variable} = {fields};\n"
-            f"{options_variable} = {options};\n"
-            f"events = merge_subwatcher_fields("
-            f"events, {variable}, {fields_variable}, {options_variable});\n"
-        )
-    return code
+def _active_time_rule_source_ids(rule: Any) -> Set[str]:
+    if not isinstance(rule, dict):
+        return set()
+    source_ids = set()
+    rule_type = rule.get("type")
+    if rule_type is None and "regex" in rule:
+        rule_type = "regex"
+    if rule_type == "regex" and isinstance(rule.get("source"), str):
+        source_ids.add(rule["source"])
+    if rule_type in ("all", "any"):
+        children = rule.get("rules") if "rules" in rule else rule.get("children")
+        if isinstance(children, list):
+            for child in children:
+                source_ids.update(_active_time_rule_source_ids(child))
+    return source_ids
 
 
-def activityEvents(
-    sources: List[ActivitySource],
-    filter_afk: bool,
-    hostname: Optional[str] = None,
-    enforce_hostname: bool = False,
-) -> str:
-    code = ""
-    for index, source in enumerate(sources):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source.source_id):
-            raise ValueError(
-                "activity source_id may only contain letters, numbers, '_' and '-'"
-            )
-        if not source.bucket_ids:
-            raise ValueError("activity source must contain at least one bucket_id")
-        if any(
-            not target or not source_field
-            for target, source_field in source.field_mappings.items()
-        ):
-            raise ValueError("activity source field mappings may not be empty")
-        variable = f"activity_source_{index}"
-        code += f"{variable} = [];\n"
-        bucket_ids = _source_bucket_ids(
-            source.bucket_ids,
-            source.host,
-            source.bucket_hosts,
-            source.scope,
-            hostname,
-            "activity",
-        )
-        for bucket_index, bucket_id in enumerate(bucket_ids):
-            code += (
-                f"activity_bucket_{index}_{bucket_index} = "
-                f"flood({_optional_bucket_query(bucket_id, _expected_source_hostname(source.scope, hostname, enforce_hostname))});\n"
-                f"{variable} = union_no_overlap("
-                f"{variable}, activity_bucket_{index}_{bucket_index});\n"
-            )
-        if filter_afk:
-            code += f"{variable} = filter_period_intersect({variable}, not_afk);\n"
-        if source.field_mappings:
-            mappings = _serialize_query_json(source.field_mappings)
-            code += f"{variable} = map_event_fields({variable}, {mappings});\n"
-        code += f"{variable} = sort_by_timestamp({variable});\n"
-        code += f"events = union_no_overlap({variable}, events);\n"
-    return code
+CURRENT_BROWSER_FAMILIES: Dict[str, Dict[str, Any]] = {
+    "chrome": {
+        "names": ["com.google.Chrome", "com.google.ChromeDev", "org.chromium.Chromium"],
+        "regex": r"(?i)^(google[-_ ]?chrome|chrome|chromium)",
+    },
+    "firefox": {
+        "names": [
+            "org.mozilla.firefox",
+            "io.gitlab.librewolf-community",
+            "net.waterfox.waterfox",
+        ],
+        "regex": r"(?i)(firefox|librewolf|waterfox|nightly)",
+    },
+    "opera": {"names": ["com.opera.Opera"], "regex": r"(?i)(opera)"},
+    "brave": {"names": ["com.brave.Browser"], "regex": r"(?i)(brave)"},
+    "edge": {
+        "names": ["com.microsoft.Edge", "com.microsoft.EdgeDev"],
+        "regex": r"(?i)^(microsoft[-_ ]?edge|msedge)",
+    },
+    "arc": {"names": [], "regex": r"(?i)^arc(\.exe)?$"},
+    "vivaldi": {"names": ["com.vivaldi.Vivaldi"], "regex": r"(?i)(vivaldi)"},
+    "orion": {"names": ["Orion"], "regex": r"(?i)(orion)"},
+    "yandex": {"names": ["ru.yandex.Browser"], "regex": r"(?i)(yandex)"},
+    "zen": {"names": ["app.zen_browser.zen"], "regex": r"(?i)(zen)"},
+    "floorp": {"names": ["one.ablaze.floorp"], "regex": r"(?i)(floorp)"},
+    "helium": {"names": ["net.imput.helium"], "regex": r"(?i)(helium)"},
+}
 
 
-def activityCoverageEvents(
-    sources: List[ActivityCoverageSource],
-    hostname: Optional[str] = None,
-    enforce_hostname: bool = False,
-) -> str:
-    _validate_unique_source_ids(sources, "activity coverage")
-    code = ""
-    for index, source in enumerate(sources):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source.source_id):
-            raise ValueError(
-                "activity coverage source_id may only contain letters, numbers, "
-                "'_' and '-'"
-            )
-        if not source.bucket_ids:
-            raise ValueError(
-                "activity coverage source must contain at least one bucket_id"
-            )
-        if not source.fields:
-            raise ValueError("activity coverage source must contain at least one field")
-        variable = f"activity_coverage_source_{index}"
-        code += f"{variable} = [];\n"
-        bucket_ids = _source_bucket_ids(
-            source.bucket_ids,
-            source.host,
-            source.bucket_hosts,
-            source.scope,
-            hostname,
-            "activity coverage",
-        )
-        for bucket_index, bucket_id in enumerate(bucket_ids):
-            bucket_variable = f"activity_coverage_bucket_{index}_{bucket_index}"
-            code += (
-                f"{bucket_variable} = flood({_optional_bucket_query(bucket_id, _expected_source_hostname(source.scope, hostname, enforce_hostname))});\n"
-                f"{variable} = union_no_overlap({variable}, {bucket_variable});\n"
-            )
-        code += (
-            f"activity_coverage_period_{index} = "
-            f"filter_period_intersect({variable}, {variable});\n"
-        )
-        code += f"events = period_union(events, activity_coverage_period_{index});\n"
-
-    for index, source in enumerate(sources):
-        variable = f"activity_coverage_source_{index}"
-        fields_variable = f"activity_coverage_fields_{index}"
-        options_variable = f"activity_coverage_options_{index}"
-        code += f"{variable} = filter_period_intersect({variable}, events);\n"
-        code += f"{fields_variable} = {_serialize_query_json(source.fields)};\n"
-        code += (
-            f"{options_variable} = "
-            f"{_serialize_query_json({'source_id': source.source_id, 'conflict': 'base_wins'})};\n"
-        )
-        code += (
-            f"events = merge_subwatcher_fields("
-            f"events, {variable}, {fields_variable}, {options_variable});\n"
-        )
-    return code
-
-
-def activityCoverageActiveOverrides(
-    sources: List[ActivityCoverageSource],
-) -> str:
-    return "\n".join(
-        f"not_afk = period_union(not_afk, activity_coverage_period_{index});"
-        for index, source in enumerate(sources)
-        if source.keeps_active
+def current_browser_focus_rule(source_id: str, family: str) -> Dict[str, Any]:
+    family_match = CURRENT_BROWSER_FAMILIES[family]
+    rules = (
+        [
+            {
+                "type": "regex",
+                "source": source_id,
+                "field": "app",
+                "regex": "^(?:"
+                + "|".join(re.escape(name) for name in family_match["names"])
+                + ")$",
+            }
+        ]
+        if family_match["names"]
+        else []
     )
-
-
-def backgroundActivityEvents(
-    sources: List[ActivitySource],
-    hostname: Optional[str] = None,
-    enforce_hostname: bool = False,
-) -> str:
-    code = ""
-    for index, source in enumerate(sources):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source.source_id):
-            raise ValueError(
-                "background activity source_id may only contain letters, numbers, "
-                "'_' and '-'"
-            )
-        if not source.bucket_ids:
-            raise ValueError(
-                "background activity source must contain at least one bucket_id"
-            )
-        if any(
-            not target or not source_field
-            for target, source_field in source.field_mappings.items()
-        ):
-            raise ValueError(
-                "background activity source field mappings may not be empty"
-            )
-        variable = f"background_source_{index}"
-        code += f"{variable} = [];\n"
-        bucket_ids = _source_bucket_ids(
-            source.bucket_ids,
-            source.host,
-            source.bucket_hosts,
-            source.scope,
-            hostname,
-            "background activity",
-        )
-        for bucket_index, bucket_id in enumerate(bucket_ids):
-            bucket_variable = f"background_bucket_{index}_{bucket_index}"
-            code += (
-                f"{bucket_variable} = "
-                f"flood({_optional_bucket_query(bucket_id, _expected_source_hostname(source.scope, hostname, enforce_hostname))});\n"
-                f"{variable} = union_no_overlap("
-                f"{variable}, {bucket_variable});\n"
-            )
-        code += f"{variable} = filter_period_intersect({variable}, not_afk);\n"
-        if source.field_mappings:
-            mappings = _serialize_query_json(source.field_mappings)
-            code += f"{variable} = map_event_fields({variable}, {mappings});\n"
-        code += f"{variable} = sort_by_timestamp({variable});\n"
-        code += f"events = union_no_overlap(events, {variable});\n"
-    return code
-
-
-def _active_time_events(
-    sources: List[ActiveTimeSource],
-    rule_spec: Dict[str, Any],
-    hostname: Optional[str],
-    enforce_hostname: bool = False,
-) -> str:
-    if not sources:
-        raise ValueError("active-time expressions require at least one source")
-    _validate_unique_source_ids(sources, "active-time")
-
-    code = ""
-    named_sources = []
-    for index, source in enumerate(sources):
-        if not re.fullmatch(r"[A-Za-z0-9_-]+", source.source_id):
-            raise ValueError(
-                "active-time source_id may only contain letters, numbers, '_' and '-'"
-            )
-        if not source.bucket_ids:
-            raise ValueError("active-time source must contain at least one bucket_id")
-        variable = f"active_source_{index}"
-        code += f"{variable} = [];\n"
-        bucket_ids = _source_bucket_ids(
-            source.bucket_ids,
-            source.host,
-            source.bucket_hosts,
-            source.scope,
-            hostname,
-            "active-time",
-        )
-        for bucket_id in bucket_ids:
-            code += (
-                f"{variable} = concat({variable}, "
-                f"flood({_optional_bucket_query(bucket_id, _expected_source_hostname(source.scope, hostname, enforce_hostname))}));\n"
-            )
-        named_sources.append(f'["{source.source_id}", {variable}]')
-
-    rule = _serialize_query_json(rule_spec)
-    code += f"active_time_rule = {rule};\n"
-    code += f"active_time_sources = [{', '.join(named_sources)}];\n"
-    code += (
-        "not_afk = active_periods_v2("
-        "active_time_sources, active_time_rule"
-        + (f", {_serialize_query_json(hostname)}" if hostname else "")
-        + ");\n"
+    rules.append(
+        {
+            "type": "regex",
+            "source": source_id,
+            "field": "app",
+            "regex": family_match["regex"],
+        }
     )
-    code += "not_afk = period_union(not_afk, []);\n"
-    return code
-
-
-def activeTimeEvents(params: DesktopQueryParams) -> str:
-    if not params.active_time_rule:
-        return ""
-    return _active_time_events(
-        params.active_time_sources,
-        params.active_time_rule,
-        params.hostname,
-        "query.query_bucket_optional.expected_hostname.v1" in params.capabilities,
-    )
-
-
-def activeTimeQuery(
-    active_time_sources: List[ActiveTimeSource],
-    active_time_rule: Dict[str, Any],
-    hostname: Optional[str] = None,
-    capabilities: Optional[List[str]] = None,
-) -> str:
-    if hostname == "":
-        raise ValueError("hostname must be non-empty")
-    return (
-        _active_time_events(
-            active_time_sources,
-            active_time_rule,
-            hostname,
-            "query.query_bucket_optional.expected_hostname.v1" in (capabilities or []),
-        )
-        + "RETURN = not_afk;"
-    )
-
-
-def legacyActiveTimeQuery(bid_afk: str, hostname: Optional[str] = None) -> str:
-    if not bid_afk:
-        raise ValueError("bid_afk must be non-empty")
-    if hostname == "":
-        raise ValueError("hostname must be non-empty")
-    return _legacy_active_time_events(bid_afk, hostname) + "\nRETURN = not_afk;"
-
-
-def activityQuery(afk_buckets: List[str]) -> str:
-    code = "not_afk = [];\n"
-    for index, bucket_id in enumerate(afk_buckets):
-        if not bucket_id:
-            raise ValueError("AFK bucket IDs must be non-empty")
-        variable = f"not_afk_{index}"
-        code += (
-            f"{variable} = query_bucket({_serialize_bucket_id(bucket_id)});\n"
-            f'{variable} = filter_keyvals({variable}, "status", ["not-afk"]);\n'
-            f"not_afk = union_no_overlap(not_afk, {variable});\n"
-        )
-    code += 'not_afk = merge_events_by_keys(not_afk, ["status"]);\n'
-    code += "RETURN = not_afk;"
-    return code
+    return rules[0] if len(rules) == 1 else {"type": "any", "rules": rules}
 
 
 def _browser_in_buckets(browser: str, browserbuckets: List[str]) -> Optional[str]:
@@ -943,8 +958,23 @@ def _browser_in_buckets(browser: str, browserbuckets: List[str]) -> Optional[str
     return None
 
 
+def current_browser_families(
+    browser_buckets: List[str],
+) -> List[Tuple[str, List[str]]]:
+    """Group selected buckets by current browser family, preserving bucket order."""
+    return [
+        (browser_name, family_buckets)
+        for browser_name in CURRENT_BROWSER_FAMILIES
+        if (
+            family_buckets := [
+                bucket_id for bucket_id in browser_buckets if browser_name in bucket_id
+            ]
+        )
+    ]
+
+
 def browsersWithBuckets(browserbuckets: List[str]) -> List[Tuple[str, str]]:
-    """Returns a list of (browserName, bucketId) pairs for found browser buckets"""
+    """Return first-family buckets for the explicit legacy target."""
     browsername_to_bucketid: List[Tuple[str, Optional[str]]] = [
         (browserName, _browser_in_buckets(browserName, browserbuckets))
         for browserName in browser_appnames
@@ -952,24 +982,6 @@ def browsersWithBuckets(browserbuckets: List[str]) -> List[Tuple[str, str]]:
 
     # Only return browsers for which a bucket could be found
     return [t for t in browsername_to_bucketid if t[1]]  # type: ignore
-
-
-def browserEvents(params: DesktopQueryParams) -> str:
-    """Returns a list of active browser events (where the browser was the active window) from all browser buckets"""
-    code = "browser_events = [];"
-
-    for browserName, bucketId in browsersWithBuckets(params.bid_browsers):
-        browser_appnames_str = _serialize_query_json(browser_appnames[browserName])
-        bucket_id_str = _serialize_bucket_id(bucketId)
-        code += f"""
-          events_{browserName} = flood(query_bucket({bucket_id_str}));
-          window_{browserName} = filter_keyvals(events, "app", {browser_appnames_str});
-          events_{browserName} = filter_period_intersect(events_{browserName}, window_{browserName});
-          events_{browserName} = split_url_events(events_{browserName});
-          browser_events = concat(browser_events, events_{browserName});
-          browser_events = sort_by_timestamp(browser_events);
-        """
-    return code
 
 
 browser_appnames = {
@@ -1050,6 +1062,11 @@ def _serialize_query_json(value: Any) -> str:
     return re.sub(r"\\+", collapse_even_backslashes, serialized)
 
 
+def serialize_query2_literal(value: Any) -> str:
+    """Serialize a Python value for Query2's raw-backslash literal grammar."""
+    return _serialize_query_json(value)
+
+
 def _serialize_bucket_id(bucket_id: str) -> str:
     trailing_backslashes = len(bucket_id) - len(bucket_id.rstrip("\\"))
     if trailing_backslashes % 2 == 1:
@@ -1059,8 +1076,8 @@ def _serialize_bucket_id(bucket_id: str) -> str:
     return _serialize_query_json(bucket_id)
 
 
-def fullDesktopQuery(
-    params: DesktopQueryParams,
+def _full_desktop_query_from_canonical(
+    params: DesktopQueryParams, canonical_query: str
 ) -> str:
     if (
         not params.bid_window
@@ -1071,7 +1088,7 @@ def fullDesktopQuery(
         raise ValueError("fullDesktopQuery requires bid_window or an activity source")
     # Build the base query
     query = f"""
-    {resolveActivityProfile(params)}
+    {canonical_query}
     title_events = sort_by_duration(merge_events_by_keys(events, ["app", "title"]));
     app_events   = sort_by_duration(merge_events_by_keys(title_events, ["app"]));
     cat_events   = sort_by_duration(merge_events_by_keys(events, ["$category"]));
@@ -1083,7 +1100,6 @@ def fullDesktopQuery(
     # Add browser-related query parts if browser buckets exist
     if params.bid_browsers:
         query += f"""
-        browser_events = split_url_events(browser_events);
         browser_urls = merge_events_by_keys(browser_events, ["url"]);
         browser_urls = sort_by_duration(browser_urls);
         browser_urls = limit_events(browser_urls, {default_limit});
@@ -1119,6 +1135,11 @@ def fullDesktopQuery(
         };
     """
     return query
+
+
+def fullDesktopQuery(params: DesktopQueryParams) -> str:
+    """Project the current canonical desktop stream into the legacy report shape."""
+    return _full_desktop_query_from_canonical(params, resolveActivityProfile(params))
 
 
 def test_fullDesktopQuery():

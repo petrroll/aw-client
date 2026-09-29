@@ -4,7 +4,7 @@ import json
 import logging
 import textwrap
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import List, Optional
 from zoneinfo import ZoneInfo
 
 import click
@@ -14,23 +14,12 @@ from tabulate import tabulate
 import aw_client
 
 from . import queries
-from .classes import default_classes, get_classes
 
 now = datetime.now(timezone.utc)
 td1day = timedelta(days=1)
 td1yr = timedelta(days=365)
 
 logger = logging.getLogger(__name__)
-
-_SOURCE_ONLY_QUERY_CAPABILITIES = {
-    "query.active_periods_v2.v1",
-    "query.categorize_v2.v1",
-    "query.merge_subwatcher_fields.source_namespace.v1",
-}
-_WINDOW_SOURCE_ID = "window"
-_WINDOW_APP_FIELD = f"$source.{_WINDOW_SOURCE_ID}.app"
-_WINDOW_TITLE_FIELD = f"$source.{_WINDOW_SOURCE_ID}.title"
-
 
 class _Context:
     client: aw_client.ActivityWatchClient
@@ -156,95 +145,22 @@ def query(
             )
 
 
-def _server_capabilities(client: aw_client.ActivityWatchClient) -> List[str]:
-    capabilities = client.get_info().get("capabilities", [])
-    return (
-        [capability for capability in capabilities if isinstance(capability, str)]
-        if isinstance(capabilities, list)
-        else []
-    )
-
-
-def _source_qualified_category_specs(
-    classes: List[Tuple[List[str], dict]],
-) -> List[Dict[str, Any]]:
-    specs = []
-    for index, (name, legacy_rule) in enumerate(classes):
-        rule = dict(legacy_rule)
-        if rule.get("regex"):
-            rule["type"] = "regex"
-            rule["source"] = _WINDOW_SOURCE_ID
-            select_keys = rule.pop("select_keys", None)
-            if select_keys:
-                if len(select_keys) == 1:
-                    rule["field"] = select_keys[0]
-                else:
-                    rule["fields"] = select_keys
-        else:
-            rule = {"type": "none"}
-        specs.append({"id": f"cli-legacy-{index}", "name": name, "rule": rule})
-    return specs
-
-
-def _canonical_query_for_capabilities(
-    hostname: str,
-    classes: List[Tuple[List[str], dict]],
-    capabilities: List[str],
-) -> Tuple[str, bool]:
-    if _SOURCE_ONLY_QUERY_CAPABILITIES.issubset(capabilities):
-        params = queries.CanonicalQueryParamsV2(
-            hostname=hostname,
-            activity_coverage_sources=[
-                queries.ActivityCoverageSource(
-                    _WINDOW_SOURCE_ID,
-                    [f"aw-watcher-window_{hostname}"],
-                    ["app", "title"],
-                    host=hostname,
-                )
-            ],
-            active_time_sources=[
-                queries.ActiveTimeSource(
-                    "afk",
-                    [f"aw-watcher-afk_{hostname}"],
-                    host=hostname,
-                )
-            ],
-            active_time_rule={
-                "type": "regex",
-                "source": "afk",
-                "field": "status",
-                "regex": "^not-afk$",
-            },
-            category_specs=_source_qualified_category_specs(classes),
-            capabilities=capabilities,
-        )
-        return queries.canonicalEventsV2(params), True
-
-    missing = sorted(_SOURCE_ONLY_QUERY_CAPABILITIES.difference(capabilities))
-    logger.warning(
-        "Server lacks source-only canonical query capabilities (%s); using the "
-        "legacy currentwindow/AFK compatibility fallback",
-        ", ".join(missing),
-    )
-    return (
-        queries.canonicalEvents(
-            queries.DesktopQueryParams(
-                bid_window=f"aw-watcher-window_{hostname}",
-                bid_afk=f"aw-watcher-afk_{hostname}",
-                classes=classes,
-            )
-        ),
-        False,
-    )
-
-
-def _report_query(canonical_query: str, app_field: str, title_field: str) -> str:
-    return f"""
-    {canonical_query}
-    title_events = sort_by_duration(merge_events_by_keys(
+def _report_query(
+    canonical_query: str,
+    app_field: Optional[str],
+    title_field: Optional[str],
+) -> str:
+    presentation = (
+        f'''title_events = sort_by_duration(merge_events_by_keys(
             events, ["{app_field}", "{title_field}"]));
     app_events = sort_by_duration(merge_events_by_keys(
-            title_events, ["{app_field}"]));
+            title_events, ["{app_field}"]));'''
+        if app_field and title_field
+        else "title_events = [];\n    app_events = [];"
+    )
+    return f"""
+    {canonical_query}
+    {presentation}
     cat_events = sort_by_duration(merge_events_by_keys(events, ["$category"]));
     app_events = limit_events(app_events, {queries.default_limit});
     title_events = limit_events(title_events, {queries.default_limit});
@@ -290,19 +206,11 @@ def report(
     if not stop.tzinfo:
         stop = stop.astimezone()
 
-    classes = get_classes()
-    canonical_query, uses_v2 = _canonical_query_for_capabilities(
-        hostname,
-        classes,
-        _server_capabilities(obj.client),
-    )
-    app_field = _WINDOW_APP_FIELD if uses_v2 else "app"
-    title_field = _WINDOW_TITLE_FIELD if uses_v2 else "title"
-    query = _report_query(
-        canonical_query,
-        app_field,
-        title_field,
-    )
+    materialized = obj.client.build_profile_query_v2(hostname=hostname)
+    source_id = materialized.app_title_source_id
+    app_field = f"$source.{source_id}.app" if source_id else None
+    title_field = f"$source.{source_id}.title" if source_id else None
+    query = _report_query(materialized.query(), app_field, title_field)
     logger.debug("Query: \n" + queries.pretty_query(query))
 
     result = obj.client.query(query, [(start, stop)], cache=cache, name=name)
@@ -321,7 +229,10 @@ def report(
         )
 
         title_events = _parse_events(period["window"]["title_events"])
-        print_top(title_events, lambda e: e.data[title_field], title="Titles", n=limit)
+        if title_field:
+            print_top(title_events, lambda e: e.data.get(title_field, ""), title="Titles", n=limit)
+        else:
+            print("Titles:\tUnavailable (profile has no app/title presentation source)\n")
 
         print(
             "Total duration:\t",
@@ -368,14 +279,8 @@ def canonical(
     if not stop.tzinfo:
         stop = stop.astimezone()
 
-    classes = default_classes
-
-    query, uses_v2 = _canonical_query_for_capabilities(
-        hostname,
-        classes,
-        _server_capabilities(obj.client),
-    )
-    query = f"""{query}\n RETURN = events;"""
+    materialized = obj.client.build_profile_query_v2(hostname=hostname)
+    query = f"""{materialized.query()}\n RETURN = events;"""
     logger.debug("Query: \n" + queries.pretty_query(query))
 
     result = obj.client.query(query, [(start, stop)], cache=cache, name=name)
@@ -392,8 +297,8 @@ def canonical(
                     (
                         str(e.timestamp).split(".")[0],
                         str(e.duration).split(".")[0],
-                        f'[{e.data[_WINDOW_APP_FIELD if uses_v2 else "app"]}] '
-                        f'{textwrap.shorten(e.data[_WINDOW_TITLE_FIELD if uses_v2 else "title"], 60, placeholder="...")}',
+                        f'[{e.data.get(f"$source.{materialized.app_title_source_id}.app", "")}] '
+                        f'{textwrap.shorten(e.data.get(f"$source.{materialized.app_title_source_id}.title", ""), 60, placeholder="...")}',
                     )
                     for e in events[-10:]
                 ],

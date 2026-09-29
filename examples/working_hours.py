@@ -1,7 +1,9 @@
 """
-Script that computes how many hours was spent in a regex-specified "work" category for each day in a given month.
+Compute time matching an ad-hoc work regex within configured canonical activity.
 
-Also saves the matching work-events to a JSON file (for auditing purposes).
+The regex intentionally overrides categorization for this analysis, while source
+coverage and active time come from the server's selected activity profile.
+Matching events are also saved to a JSON file for inspection.
 """
 
 import json
@@ -11,10 +13,10 @@ import re
 import socket
 import sys
 from datetime import datetime, time, timedelta
-from typing import Dict, List, Tuple
+from typing import List
 
 import aw_client
-from aw_client import queries
+from aw_client.queries import serialize_query2_literal
 from aw_core import Event
 from aw_transform import flood
 from tabulate import tabulate
@@ -55,29 +57,19 @@ def query(regex: str, timeperiods, hostname: str):
     print(f"  Day offset: {day_offset}")
     print("")
 
-    categories: List[Tuple[List[str], Dict]] = [
-        (
-            ["Work"],
-            {
-                "type": "regex",
-                "regex": regex,
-                "ignore_case": True,
-            },
-        )
-    ]
-
     aw = aw_client.ActivityWatchClient(client_name="working_hours")
-
-    canonicalQuery = queries.canonicalEvents(
-        queries.DesktopQueryParams(
-            bid_window=f"aw-watcher-window_{hostname}",
-            bid_afk=f"aw-watcher-afk_{hostname}",
-            classes=categories,
-            filter_classes=[["Work"]],
-        )
-    )
+    profile = aw.build_profile_query_v2(hostname=hostname)
+    source_id = profile.app_title_source_id
+    if source_id is None:
+        raise ValueError("the selected activity profile has no app/title presentation source")
+    app_field = f"$source.{source_id}.app"
+    title_field = f"$source.{source_id}.title"
+    pattern = serialize_query2_literal(f"(?i){regex}")
     query = f"""
-    {canonicalQuery}
+    {profile.query()}
+    matching_app = filter_keyvals_regex(events, "{app_field}", {pattern});
+    matching_title = filter_keyvals_regex(events, "{title_field}", {pattern});
+    events = union_no_overlap(matching_app, matching_title);
     duration = sum_durations(events);
     RETURN = {{"events": events, "duration": duration}};
     """

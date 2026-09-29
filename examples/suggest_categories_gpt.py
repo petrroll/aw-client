@@ -181,7 +181,7 @@ def parse_gpt_response(text: str, categories: List[Category], title=None, quiet=
 
 def main():
     categories = example_categories()
-    events = get_events(categories)
+    events = get_events()
 
     events_by_dur = sorted(events, key=lambda e: e.duration, reverse=True)
     for event in events_by_dur[:100]:

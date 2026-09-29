@@ -7,7 +7,11 @@ from aw_datastore import Datastore
 from aw_datastore.storages import MemoryStorage
 from aw_query import query
 
+from aw_client.legacy_v1 import canonical_events as legacy_canonical_events
+from aw_client.legacy_v1 import full_desktop_query as legacy_full_desktop_query
+
 from aw_client.queries import (
+    CURRENT_QUERY_CAPABILITIES,
     _serialize_query_json,
     ActiveTimeSource,
     ActivityCoverageSource,
@@ -16,7 +20,6 @@ from aw_client.queries import (
     CanonicalQueryParamsV2,
     ContextSource,
     DesktopQueryParams,
-    activeTimeQuery,
     activityQuery,
     canonicalEvents,
     canonicalEventsV2,
@@ -93,12 +96,11 @@ def test_canonical_events_uses_v2_categories_after_context_enrichment():
         )
     )
 
-    assert 'query_bucket_optional("aw-watcher-win-vdesktop_test")' in query
+    assert 'query_bucket_optional_raw("aw-watcher-win-vdesktop_test")' in query
     assert '"source_id":"vdesktop"' in query
-    assert 'context_fields_0 = ["vdesktop"];' in query
     assert (
-        "merge_subwatcher_fields("
-        "events, context_0, context_fields_0, context_options_0);"
+        'merge_subwatcher_fields(events, context_source_0, ["vdesktop"], '
+        '{"source_id":"vdesktop","conflict":"base_wins"});'
     ) in query
     assert "events = categorize_v2(events" in query
     assert query.index("merge_subwatcher_fields") < query.index("categorize_v2")
@@ -199,6 +201,151 @@ def test_generated_canonical_query_executes_context_categorization():
     assert result[0].data["$category"] == ["Personal"]
 
 
+@pytest.mark.parametrize("pipeline", ["legacy", "v2"])
+def test_context_enrichment_preserves_latest_overlapping_source_event(pipeline):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=120)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    coverage = datastore.create_bucket(
+        bucket_id=f"coverage-overlap-{pipeline}",
+        type="activity",
+        client="test",
+        hostname="test",
+        name="coverage",
+    )
+    context = datastore.create_bucket(
+        bucket_id=f"context-overlap-{pipeline}",
+        type="context",
+        client="test",
+        hostname="test",
+        name="context",
+    )
+    coverage.insert(
+        Event(
+            timestamp=start + timedelta(seconds=30),
+            duration=timedelta(seconds=10),
+            data={"label": "base"},
+        )
+    )
+    context.insert(
+        Event(
+            timestamp=start,
+            duration=timedelta(seconds=100),
+            data={"name": "older-long"},
+        )
+    )
+    context.insert(
+        Event(
+            timestamp=start + timedelta(seconds=20),
+            duration=timedelta(seconds=40),
+            data={"name": "newer-short"},
+        )
+    )
+
+    coverage_source = ActivityCoverageSource(
+        "coverage",
+        [f"coverage-overlap-{pipeline}"],
+        ["label"],
+        scope="global",
+    )
+    context_source = ContextSource(
+        "context",
+        [f"context-overlap-{pipeline}"],
+        ["name"],
+        scope="global",
+    )
+    capabilities = ["query.merge_subwatcher_fields.source_namespace.v1"]
+    if pipeline == "legacy":
+        generated = canonicalEvents(
+            DesktopQueryParams(
+                filter_afk=False,
+                activity_coverage_sources=[coverage_source],
+                context_sources=[context_source],
+                capabilities=capabilities,
+            )
+        )
+    else:
+        generated = canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                activity_coverage_sources=[coverage_source],
+                context_sources=[context_source],
+                capabilities=capabilities,
+                filter_afk=False,
+            )
+        )
+
+    result = query(
+        f"context-overlap-{pipeline}",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert "context_0 = filter_period_intersect(context_0, events);" not in generated
+    assert len(result) == 1
+    assert result[0].timestamp == start + timedelta(seconds=30)
+    assert result[0].duration == timedelta(seconds=10)
+    assert result[0].data["$source.coverage.label"] == "base"
+    assert result[0].data["$source.context.name"] == "newer-short"
+
+
+def test_combining_browser_family_buckets_before_projection_preserves_latest_event():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=120)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    buckets = {
+        "coverage": [(30, 10, {"app": "Chrome"})],
+        "browser-single": [
+            (0, 100, {"url": "https://old.example"}),
+            (20, 40, {"url": "https://new.example"}),
+        ],
+        "browser-old": [(0, 100, {"url": "https://old.example"})],
+        "browser-new": [(20, 40, {"url": "https://new.example"})],
+    }
+    for bucket_id, events in buckets.items():
+        bucket = datastore.create_bucket(
+            bucket_id=bucket_id,
+            type="test",
+            client="test",
+            hostname="test",
+            name=bucket_id,
+        )
+        for offset, duration, data in events:
+            bucket.insert(
+                Event(
+                    timestamp=start + timedelta(seconds=offset),
+                    duration=timedelta(seconds=duration),
+                    data=data,
+                )
+            )
+
+    def run(bucket_ids):
+        loads = "\n".join(
+            f'browser = concat(browser, flood(query_bucket("{bucket_id}")));'
+            for bucket_id in bucket_ids
+        )
+        generated = f'''events = query_bucket("coverage");
+browser = [];
+{loads}
+browser = sort_by_timestamp(browser);
+events = merge_subwatcher_fields(events, browser, ["url"]);
+RETURN = events;'''
+        return query("browser-family-precedence", generated, start, end, datastore)
+
+    results = [
+        run(["browser-single"]),
+        run(["browser-old", "browser-new"]),
+        run(["browser-new", "browser-old"]),
+    ]
+    for result in results:
+        assert len(result) == 1
+        assert result[0].timestamp == start + timedelta(seconds=30)
+        assert result[0].duration == timedelta(seconds=10)
+        assert result[0].data["url"] == "https://new.example"
+    assert results[0] == results[1] == results[2]
+
+
 def test_canonical_events_keeps_legacy_categorization_by_default():
     query = canonicalEvents(
         DesktopQueryParams(
@@ -230,8 +377,8 @@ def test_context_sources_with_similar_ids_use_distinct_variables():
         )
     )
 
-    assert "context_0 = [];" in query
-    assert "context_1 = [];" in query
+    assert "context_source_0_raw = [];" in query
+    assert "context_source_1_raw = [];" in query
 
 
 def test_context_sources_select_only_buckets_for_current_host():
@@ -259,8 +406,8 @@ def test_context_sources_select_only_buckets_for_current_host():
         )
     )
 
-    assert 'query_bucket_optional("browser_laptop")' in query_code
-    assert 'query_bucket_optional("browser_desktop")' not in query_code
+    assert 'query_bucket_optional_raw("browser_laptop", "laptop")' in query_code
+    assert 'query_bucket_optional_raw("browser_desktop")' not in query_code
 
 
 def test_context_sources_reject_incomplete_bucket_host_mapping():
@@ -287,15 +434,16 @@ def test_context_sources_reject_incomplete_bucket_host_mapping():
         )
 
 
-def test_canonical_events_rejects_v2_without_server_capability():
-    with pytest.raises(ValueError, match="query.categorize_v2.v1"):
-        canonicalEvents(
-            DesktopQueryParams(
-                bid_window="aw-watcher-window_test",
-                bid_afk="aw-watcher-afk_test",
-                category_specs=[{"name": ["Work"], "rule": {"type": "none"}}],
-            )
+def test_canonical_events_targets_current_v2_without_capability_hints():
+    generated = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="aw-watcher-window_test",
+            bid_afk="aw-watcher-afk_test",
+            category_specs=[{"name": ["Work"], "rule": {"type": "none"}}],
         )
+    )
+    assert "query_bucket_optional_raw" in generated
+    assert "events = categorize_v2" in generated
 
 
 def test_canonical_events_keeps_explicitly_empty_v2_categories():
@@ -355,7 +503,7 @@ def test_canonical_events_compiles_active_time_expressions():
 
 
 def test_canonical_events_compiles_replacement_activity_sources():
-    query = canonicalEvents(
+    query = legacy_canonical_events(
         DesktopQueryParams(
             bid_window="aw-watcher-window_test",
             bid_afk="aw-watcher-afk_test",
@@ -405,15 +553,15 @@ def test_canonical_events_compiles_abstract_activity_coverage():
         )
     )
 
-    assert "events = period_union(events, activity_coverage_period_0)" in generated
-    assert "events = period_union(events, activity_coverage_period_1)" in generated
+    assert "coverage = period_union(coverage, coverage_period_0)" in generated
+    assert "coverage = period_union(coverage, coverage_period_1)" in generated
     assert '"source_id":"meeting"' in generated
     assert '"source_id":"desktop"' in generated
     assert "events = union_no_overlap(activity_coverage_source_" not in generated
 
 
 def test_activity_coverage_rejects_duplicate_source_ids():
-    with pytest.raises(ValueError, match="activity coverage source ids must be unique"):
+    with pytest.raises(ValueError, match="canonical fact source ids must be unique"):
         canonicalEvents(
             DesktopQueryParams(
                 bid_window=None,
@@ -434,7 +582,7 @@ def test_activity_coverage_rejects_duplicate_source_ids():
 
 @pytest.mark.parametrize("filter_afk", [False, True])
 def test_canonical_events_sorts_replacement_sources_before_union(filter_afk):
-    query = canonicalEvents(
+    query = legacy_canonical_events(
         DesktopQueryParams(
             bid_window="aw-watcher-window_test",
             bid_afk="aw-watcher-afk_test",
@@ -501,7 +649,7 @@ def test_canonical_events_passes_hostname_to_desktop_bucket_selection():
 
 
 def test_canonical_events_passes_hostname_to_android_bucket_selection():
-    query = canonicalEvents(
+    query = legacy_canonical_events(
         AndroidQueryParams(
             hostname="phone",
             bid_android="aw-watcher-android",
@@ -554,53 +702,109 @@ def test_activity_query_serializes_bucket_ids():
         activityQuery(["afk\\"])
 
 
-def test_active_time_expression_query_needs_no_window_or_afk_and_executes():
+@pytest.mark.parametrize(
+    "rule",
+    [
+        {"type": "none"},
+        {"type": "any", "rules": [{"type": "none"}]},
+    ],
+)
+def test_source_free_none_rules_build_and_execute_across_native_entrypoints(rule):
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     end = start + timedelta(minutes=1)
     datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
-    activity = datastore.create_bucket(
-        bucket_id="meeting_test",
-        type="meeting",
+    coverage = datastore.create_bucket(
+        bucket_id="source-free-coverage",
+        type="activity",
         client="test",
         hostname="test",
-        name="meeting",
+        name="coverage",
     )
-    activity.insert(
-        Event(
-            timestamp=start,
-            duration=timedelta(seconds=20),
-            data={"state": "active"},
+    coverage.insert(
+        Event(timestamp=start, duration=timedelta(seconds=20), data={"label": "base"})
+    )
+    coverage_source = ActivityCoverageSource(
+        "coverage", ["source-free-coverage"], ["label"], scope="global"
+    )
+    capabilities = [
+        "query.active_periods_v2.v1",
+        "query.merge_subwatcher_fields.source_namespace.v1",
+    ]
+    generated_queries = [
+        canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                activity_coverage_sources=[coverage_source],
+                active_time_rule=rule,
+                capabilities=capabilities,
+            )
         )
-    )
+        + "\nRETURN = events;",
+        canonicalEvents(
+            DesktopQueryParams(
+                filter_afk=True,
+                activity_coverage_sources=[coverage_source],
+                active_time_rule=rule,
+                capabilities=capabilities,
+            )
+        )
+        + "\nRETURN = events;",
+    ]
 
-    generated = activeTimeQuery(
-        [ActiveTimeSource("meeting", ["meeting_test"], scope="global")],
+    for index, generated in enumerate(generated_queries):
+        assert "active_time_sources = [];" in generated
+        assert query(
+            f"source-free-none-{index}", generated, start, end, datastore
+        ) == []
+
+
+@pytest.mark.parametrize(
+    "rule",
+    [
         {
-            "type": "regex",
-            "source": "meeting",
-            "field": "state",
-            "regex": "active",
+            "type": "any",
+            "children": [
+                {
+                    "type": "regex",
+                    "source": "missing",
+                    "field": "status",
+                    "regex": "active",
+                    "host": "B",
+                }
+            ],
         },
-    )
-    result = query("active-expression-only", generated, start, end, datastore)
+        {
+            "source": "missing",
+            "field": "status",
+            "regex": "active",
+            "host": "B",
+        },
+    ],
+)
+def test_active_time_aliases_reject_unknown_sources_across_native_entrypoints(rule):
+    capabilities = ["query.active_periods_v2.v1"]
+    builders = [
+        lambda: canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                hostname="A",
+                active_time_rule=rule,
+                capabilities=capabilities,
+            )
+        ),
+        lambda: canonicalEvents(
+            DesktopQueryParams(
+                hostname="A",
+                active_time_rule=rule,
+                capabilities=capabilities,
+            )
+        ),
+    ]
 
-    assert "find_bucket" not in generated
-    assert len(result) == 1
-    assert result[0].duration == timedelta(seconds=20)
+    for builder in builders:
+        with pytest.raises(ValueError, match="unknown source.*missing"):
+            builder()
 
 
-def test_standalone_active_time_query_can_enforce_bucket_hostname():
-    generated = activeTimeQuery(
-        [ActiveTimeSource("presence", ["presence-laptop"], host="laptop")],
-        {"type": "none"},
-        hostname="laptop",
-        capabilities=["query.query_bucket_optional.expected_hostname.v1"],
-    )
-
-    assert 'query_bucket_optional("presence-laptop", "laptop")' in generated
-
-
-def test_canonical_expression_needs_no_window_or_afk_and_executes():
+def test_legacy_expression_needs_no_window_or_afk_and_executes():
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     end = start + timedelta(minutes=1)
     datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
@@ -619,7 +823,7 @@ def test_canonical_expression_needs_no_window_or_afk_and_executes():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             filter_afk=True,
             category_specs=[],
@@ -674,7 +878,7 @@ def test_alternative_activity_source_needs_no_window_and_executes():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             filter_afk=False,
             category_specs=[],
@@ -711,7 +915,7 @@ def test_missing_optional_activity_and_context_sources_execute_as_empty():
     end = start + timedelta(minutes=1)
     datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             filter_afk=False,
             category_specs=[],
@@ -746,7 +950,7 @@ def test_missing_optional_activity_and_context_sources_execute_as_empty():
 
 
 def test_all_source_roles_respect_host_and_global_scope():
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             hostname="laptop",
             filter_afk=True,
@@ -810,7 +1014,7 @@ def test_all_source_roles_respect_host_and_global_scope():
 
 
 def test_bucket_hosts_partition_applies_to_all_source_roles():
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             hostname="laptop",
             filter_afk=True,
@@ -897,8 +1101,8 @@ def test_host_scoped_sources_emit_server_hostname_check_when_supported():
         )
     )
 
-    assert 'query_bucket_optional("context-laptop", "laptop")' in generated
-    assert 'query_bucket_optional("context-global")' in generated
+    assert 'query_bucket_optional_raw("context-laptop", "laptop")' in generated
+    assert 'query_bucket_optional_raw("context-global")' in generated
 
 
 @pytest.mark.parametrize(
@@ -938,7 +1142,7 @@ def test_source_roles_reject_missing_scope_and_ownership(source, capabilities):
         kwargs["context_sources"] = [source]
 
     with pytest.raises(ValueError, match="scope is required"):
-        canonicalEvents(DesktopQueryParams(**kwargs))
+        legacy_canonical_events(DesktopQueryParams(**kwargs))
 
 
 @pytest.mark.parametrize(
@@ -986,34 +1190,34 @@ def test_source_roles_reject_incomplete_bucket_hosts(source):
         kwargs["context_sources"] = [source]
 
     with pytest.raises(ValueError, match="map every bucket exactly once"):
-        canonicalEvents(DesktopQueryParams(**kwargs))
+        legacy_canonical_events(DesktopQueryParams(**kwargs))
 
 
 def test_source_scope_rejects_duplicates_and_conflicting_ownership():
+    capabilities = sorted(CURRENT_QUERY_CAPABILITIES)
     with pytest.raises(ValueError, match="duplicate bucket_ids"):
-        activeTimeQuery(
-            [
-                ActiveTimeSource(
-                    "duplicate",
-                    ["bucket", "bucket"],
-                    scope="global",
-                )
-            ],
-            {"type": "none"},
+        canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                filter_afk=False,
+                capabilities=capabilities,
+                active_time_sources=[
+                    ActiveTimeSource("duplicate", ["bucket", "bucket"], scope="global")
+                ],
+                active_time_rule={"type": "none"},
+            )
         )
 
     with pytest.raises(ValueError, match="must not define host"):
-        activeTimeQuery(
-            [
-                ActiveTimeSource(
-                    "conflict",
-                    ["bucket"],
-                    host="host",
-                    scope="global",
-                )
-            ],
-            {"type": "none"},
-            hostname="host",
+        canonicalEventsV2(
+            CanonicalQueryParamsV2(
+                hostname="host",
+                filter_afk=False,
+                capabilities=capabilities,
+                active_time_sources=[
+                    ActiveTimeSource("conflict", ["bucket"], host="host", scope="global")
+                ],
+                active_time_rule={"type": "none"},
+            )
         )
 
 
@@ -1050,7 +1254,7 @@ def test_activity_source_priority_preserves_union_no_overlap_precedence():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             filter_afk=False,
             category_specs=[],
@@ -1187,6 +1391,7 @@ def test_canonical_events_v2_meeting_only_needs_no_window_or_afk():
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     )
     result = query(
@@ -1235,6 +1440,7 @@ def test_canonical_events_v2_stopwatch_label_creates_namespaced_coverage():
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     )
     result = query(
@@ -1280,12 +1486,15 @@ def test_canonical_events_v2_keeps_configured_coverage_active():
     )
 
     assert (
-        "not_afk = period_union(not_afk, activity_coverage_period_0);"
+        "not_afk = period_union(not_afk, coverage_period_0);"
         in generated
     )
-    assert generated.index("period_union(not_afk") < generated.index(
-        "filter_period_intersect(events, not_afk)"
+    override_index = generated.index(
+        "not_afk = period_union(not_afk, coverage_period_0);"
     )
+    normalize_index = generated.index("not_afk = period_union(not_afk, []);")
+    mask_index = generated.index("events = filter_period_intersect(events, not_afk);")
+    assert override_index < normalize_index < mask_index
 
 
 def test_canonical_events_v2_ignores_unreferenced_currentwindow_bucket():
@@ -1332,6 +1541,7 @@ def test_canonical_events_v2_ignores_unreferenced_currentwindow_bucket():
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     )
     result = query(
@@ -1378,6 +1588,7 @@ def test_canonical_events_v2_explicit_window_source_is_namespaced_only():
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     )
     result = query(
@@ -1426,6 +1637,7 @@ def test_canonical_events_v2_non_coverage_sources_cannot_create_coverage(source_
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     else:
         params = CanonicalQueryParamsV2(
@@ -1487,6 +1699,9 @@ def test_canonical_events_v2_does_not_accept_root_field_injection():
         "category_specs",
         "hostname",
         "capabilities",
+        "filter_afk",
+        "filter_categories",
+        "explain_categories",
     }
     with pytest.raises(TypeError, match="unexpected keyword argument 'bid_window'"):
         canonicalEventsV2(CanonicalQueryParamsV2(), bid_window="unrelated")
@@ -1544,10 +1759,423 @@ def test_canonical_events_v2_normalizes_empty_bucket_host_map():
                 )
             ],
             capabilities=["query.merge_subwatcher_fields.source_namespace.v1"],
+            filter_afk=False,
         )
     )
 
-    assert 'query_bucket_optional("meeting")' in query_text
+    assert 'query_bucket_optional_raw("meeting")' in query_text
+
+
+def test_current_legacy_adapter_reuses_focused_browser_for_audible_activity():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=20)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    fixtures = [
+        (
+            "aw-watcher-window_imported",
+            "currentwindow",
+            {"app": "Google Chrome", "title": "Focused"},
+        ),
+        ("aw-watcher-afk_imported", "afkstatus", {"status": "afk"}),
+        (
+            "aw-watcher-web-chrome_imported",
+            "web.tab.current",
+            {"url": "https://example.test", "title": "Page", "audible": True},
+        ),
+    ]
+    for bucket_id, bucket_type, data in fixtures:
+        bucket = datastore.create_bucket(
+            bucket_id=bucket_id,
+            type=bucket_type,
+            client="test",
+            hostname="host-a",
+            name=bucket_id,
+        )
+        bucket.insert(Event(timestamp=start, duration=end - start, data=data))
+
+    capabilities = [*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"]
+
+    def run(include_audible):
+        generated = canonicalEvents(
+            DesktopQueryParams(
+                bid_window="aw-watcher-window_",
+                bid_afk="aw-watcher-afk_",
+                bid_browsers=["aw-watcher-web-chrome_imported"],
+                hostname="host-a",
+                capabilities=capabilities,
+                include_audible=include_audible,
+            )
+        )
+        result = query(
+            f"current-browser-audible-{include_audible}",
+            generated + '\nRETURN = {"events": events, "browser": browser_events};',
+            start,
+            end,
+            datastore,
+        )
+        return generated, result
+
+    generated, included = run(True)
+    _, excluded = run(False)
+
+    assert "browser_resolved_chrome = merge_subwatcher_fields" in generated
+    assert "active_source_1 = filter_period_intersect" not in generated
+    assert generated.count('query_bucket_optional_raw("aw-watcher-web-chrome_imported"') == 1
+    assert len(included["events"]) == 1
+    assert included["events"][0].data["app"] == "Google Chrome"
+    assert len(included["browser"]) == 1
+    assert included["browser"][0].data["url"] == "https://example.test"
+    assert excluded["events"] == []
+    assert excluded["browser"] == []
+
+    custom = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="aw-watcher-window_",
+            bid_browsers=["aw-watcher-web-chrome_imported"],
+            hostname="host-a",
+            capabilities=capabilities,
+            active_time_rule={"type": "none"},
+        )
+    )
+    assert '"field":"audible"' not in custom
+    assert "browser_chrome = split_url_events(browser_resolved_chrome);" in custom
+
+
+def test_current_legacy_browser_projection_is_bounded_to_query_period():
+    origin = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    for bucket_id, bucket_type, data in [
+        ("window", "currentwindow", {"app": "Google Chrome", "title": "Focused"}),
+        ("afk", "afkstatus", {"status": "not-afk"}),
+        ("aw-watcher-web-chrome", "web.tab.current", {"url": "https://example.test"}),
+    ]:
+        bucket = datastore.create_bucket(
+            bucket_id=bucket_id,
+            type=bucket_type,
+            client="test",
+            hostname="host-a",
+            name=bucket_id,
+        )
+        bucket.insert(Event(timestamp=origin, duration=100, data=data))
+    generated = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="window",
+            bid_afk="afk",
+            bid_browsers=["aw-watcher-web-chrome"],
+            hostname="host-a",
+            capabilities=[*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"],
+        )
+    )
+    result = query(
+        "bounded-browser-projection",
+        generated + "\nRETURN = [events, not_afk, browser_events];",
+        origin + timedelta(seconds=20),
+        origin + timedelta(seconds=30),
+        datastore,
+    )
+    for stream in result:
+        assert sum((event.duration for event in stream), timedelta()) == timedelta(seconds=10)
+        assert stream[0].timestamp == origin + timedelta(seconds=20)
+
+
+def test_current_legacy_adapter_rejects_always_active_without_window_projection():
+    with pytest.raises(ValueError, match="always_active_pattern requires"):
+        canonicalEvents(
+            DesktopQueryParams(
+                bid_window="window",
+                bid_afk="afk",
+                legacy_window_mode="none",
+                always_active_pattern="meeting",
+                capabilities=[*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    ("browser_events", "expected_duration"),
+    [([], timedelta(0)), ([(5, 2)], timedelta(seconds=2)), (None, timedelta(0))],
+)
+def test_current_browser_projection_requires_browser_presence(browser_events, expected_duration):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=10)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    window = datastore.create_bucket(
+        bucket_id="presence-window",
+        type="currentwindow",
+        client="test",
+        hostname="host",
+        name="window",
+    )
+    afk = datastore.create_bucket(
+        bucket_id="presence-afk",
+        type="afkstatus",
+        client="test",
+        hostname="host",
+        name="afk",
+    )
+    window.insert(Event(timestamp=start, duration=10, data={"app": "Google Chrome", "title": "Focused"}))
+    afk.insert(Event(timestamp=start, duration=10, data={"status": "not-afk"}))
+    if browser_events is not None:
+        browser = datastore.create_bucket(
+            bucket_id="aw-watcher-web-chrome-presence",
+            type="web.tab.current",
+            client="test",
+            hostname="host",
+            name="browser",
+        )
+        for offset, duration in browser_events:
+            browser.insert(
+                Event(
+                    timestamp=start + timedelta(seconds=offset),
+                    duration=duration,
+                    data={"url": "https://example.test/page", "title": "Page"},
+                )
+            )
+    params = DesktopQueryParams(
+        bid_window="presence-window",
+        bid_afk="presence-afk",
+        bid_browsers=["aw-watcher-web-chrome-presence"],
+        hostname="host",
+        include_audible=False,
+    )
+    generated = canonicalEvents(params)
+    browser_result = query(
+        "browser-presence-canonical",
+        generated + '\nRETURN = {"events": browser_events, "duration": sum_durations(browser_events)};',
+        start,
+        end,
+        datastore,
+    )
+    full_result = query(
+        "browser-presence-full", fullDesktopQuery(params), start, end, datastore
+    )["browser"]
+
+    assert browser_result["duration"] == expected_duration
+    assert full_result["duration"] == expected_duration
+    if expected_duration:
+        assert [event.data["url"] for event in full_result["urls"]] == [
+            "https://example.test/page"
+        ]
+        assert all(event.data for event in full_result["urls"])
+    else:
+        assert browser_result["events"] == []
+        assert full_result["urls"] == []
+        assert full_result["domains"] == []
+
+
+@pytest.mark.parametrize("meeting_present", [True, False])
+def test_current_browser_projection_is_bounded_by_context_mode_activity_coverage(
+    meeting_present,
+):
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=30)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    for bucket_id, bucket_type, duration, offset, data in [
+        ("context-window", "currentwindow", 30, 0, {"app": "Google Chrome", "title": "Focused"}),
+        ("context-afk", "afkstatus", 30, 0, {"status": "not-afk"}),
+        ("aw-watcher-web-chrome-context", "web.tab.current", 30, 0, {"url": "https://example.test", "title": "Page"}),
+    ]:
+        bucket = datastore.create_bucket(
+            bucket_id=bucket_id,
+            type=bucket_type,
+            client="test",
+            hostname="host",
+            name=bucket_id,
+        )
+        bucket.insert(
+            Event(
+                timestamp=start + timedelta(seconds=offset),
+                duration=duration,
+                data=data,
+            )
+        )
+    if meeting_present:
+        meeting = datastore.create_bucket(
+            bucket_id="meeting",
+            type="meeting",
+            client="test",
+            hostname="host",
+            name="meeting",
+        )
+        meeting.insert(
+            Event(
+                timestamp=start + timedelta(seconds=10),
+                duration=10,
+                data={"subject": "Planning"},
+            )
+        )
+    params = DesktopQueryParams(
+        bid_window="context-window",
+        bid_afk="context-afk",
+        bid_browsers=["aw-watcher-web-chrome-context"],
+        hostname="host",
+        legacy_window_mode="context",
+        activity_coverage_sources=[
+            ActivityCoverageSource(
+                "meeting",
+                ["meeting"],
+                ["subject"],
+                scope="global",
+                keeps_active=True,
+            )
+        ],
+    )
+    generated = canonicalEvents(params)
+    result = query(
+        "context-browser-coverage",
+        generated
+        + '\nRETURN = {"events": events, "active": not_afk, "browser": browser_events};',
+        start,
+        end,
+        datastore,
+    )
+    full = query("context-browser-full", fullDesktopQuery(params), start, end, datastore)
+    expected = timedelta(seconds=10 if meeting_present else 0)
+
+    assert sum((event.duration for event in result["events"]), timedelta()) == expected
+    assert sum((event.duration for event in result["active"]), timedelta()) == expected
+    assert sum((event.duration for event in result["browser"]), timedelta()) == expected
+    assert full["window"]["duration"] == expected
+    assert full["browser"]["duration"] == expected
+
+
+def test_current_adapter_groups_all_selected_buckets_in_a_browser_family():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=30)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    for bucket_id, bucket_type, data in [
+        ("family-window", "currentwindow", {"app": "Google Chrome", "title": "Focused"}),
+        ("family-afk", "afkstatus", {"status": "afk"}),
+        ("aw-watcher-web-chrome-a", "web.tab.current", {"audible": True}),
+        ("aw-watcher-web-chrome-z", "web.tab.current", {"audible": False}),
+    ]:
+        bucket = datastore.create_bucket(
+            bucket_id=bucket_id,
+            type=bucket_type,
+            client="test",
+            hostname="host",
+            name=bucket_id,
+        )
+        bucket.insert(Event(timestamp=start, duration=30, data=data))
+    generated = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="family-window",
+            bid_afk="family-afk",
+            bid_browsers=["aw-watcher-web-chrome-a", "aw-watcher-web-chrome-z"],
+            hostname="host",
+            include_audible=True,
+        )
+    )
+    result = query(
+        "browser-family-order",
+        generated + '\nRETURN = {"events": events, "active": not_afk};',
+        start,
+        end,
+        datastore,
+    )
+
+    assert generated.count("active_source_1_raw = concat") == 2
+    assert result == {"events": [], "active": []}
+
+
+def test_current_legacy_adapter_classifies_windowless_generic_coverage():
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    end = start + timedelta(seconds=20)
+    datastore = Datastore(storage_strategy=MemoryStorage, testing=True)
+    bucket = datastore.create_bucket(
+        bucket_id="meeting-imported",
+        type="meeting",
+        client="test",
+        hostname="host-a",
+        name="meeting",
+    )
+    bucket.insert(
+        Event(
+            timestamp=start,
+            duration=end - start,
+            data={"project": "Alpha", "subject": "Planning"},
+        )
+    )
+    generated = canonicalEvents(
+        DesktopQueryParams(
+            hostname="host-a",
+            filter_afk=False,
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "meeting",
+                    ["meeting-imported"],
+                    ["project", "subject"],
+                    host="host-a",
+                )
+            ],
+            category_specs=[
+                {
+                    "id": "work",
+                    "name": ["Work"],
+                    "rule": {
+                        "type": "regex",
+                        "source": "meeting",
+                        "field": "project",
+                        "regex": "^Alpha$",
+                    },
+                }
+            ],
+            filter_classes=[["Work"]],
+            capabilities=[*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"],
+        )
+    )
+    result = query(
+        "current-windowless-category",
+        generated + "\nRETURN = events;",
+        start,
+        end,
+        datastore,
+    )
+
+    assert len(result) == 1
+    assert result[0].data["$category"] == ["Work"]
+    assert result[0].data["$source.meeting.project"] == "Alpha"
+    assert generated.index("categorize_v2") < generated.index("filter_keyvals")
+
+
+def test_current_legacy_window_projection_restores_other_coverage_namespaces():
+    generated = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="aw-watcher-window_",
+            bid_afk="aw-watcher-afk_",
+            hostname="host-a",
+            filter_afk=False,
+            activity_coverage_sources=[
+                ActivityCoverageSource(
+                    "meeting",
+                    ["meeting-imported"],
+                    ["project"],
+                    host="host-a",
+                )
+            ],
+            capabilities=[*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"],
+        )
+    )
+
+    reset = generated.index("events = period_union([], events)")
+    restored = generated.index(
+        'merge_subwatcher_fields(events, coverage_source_1, ["project"], '
+        '{"source_id":"meeting","conflict":"base_wins"})',
+        reset,
+    )
+    assert reset < restored
+
+    always_active = canonicalEvents(
+        DesktopQueryParams(
+            bid_window="aw-watcher-window_",
+            bid_afk="aw-watcher-afk_",
+            hostname="host-a",
+            always_active_pattern="meeting",
+            capabilities=[*CURRENT_QUERY_CAPABILITIES, "query.categorize_v2.v1"],
+        )
+    )
+    assert always_active.count('find_bucket("aw-watcher-window_", "host-a")') == 1
+    assert "active_source_1 = coverage_source_0;" in always_active
 
 
 def test_full_desktop_query_accepts_alternative_activity_without_window():
@@ -1583,7 +2211,7 @@ def test_full_desktop_query_accepts_alternative_activity_without_window():
         )
     )
 
-    generated = fullDesktopQuery(
+    generated = legacy_full_desktop_query(
         DesktopQueryParams(
             bid_afk="afk_test",
             category_specs=[],
@@ -1676,7 +2304,7 @@ def test_full_desktop_query_accepts_custom_active_rule_without_afk():
 
 
 def test_canonical_events_compiles_background_sources_after_activity_mask():
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             bid_window="window",
             bid_afk="afk",
@@ -1744,7 +2372,7 @@ def test_background_source_without_window_uses_active_time_rule():
         )
     )
 
-    generated = fullDesktopQuery(
+    generated = legacy_full_desktop_query(
         DesktopQueryParams(
             category_specs=[],
             capabilities=[
@@ -1831,7 +2459,7 @@ def test_window_activity_wins_overlapping_background_source():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             bid_window="window",
             bid_afk="afk",
@@ -1892,7 +2520,7 @@ def test_background_source_is_clipped_to_active_mask():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             bid_afk="afk",
             filter_afk=False,
@@ -1938,7 +2566,7 @@ def test_background_source_host_mismatch_is_excluded():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             hostname="laptop",
             category_specs=[],
@@ -1996,7 +2624,7 @@ def test_missing_optional_background_bucket_executes_as_empty():
         )
     )
 
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         DesktopQueryParams(
             bid_afk="afk",
             category_specs=[],
@@ -2032,7 +2660,7 @@ def test_full_desktop_query_serializes_quoted_bucket_ids_without_mutating_params
     generated = fullDesktopQuery(params)
 
     assert 'find_bucket("window\\"id")' in generated
-    assert 'query_bucket("aw-watcher-web-chrome_\\"id")' in generated
+    assert 'query_bucket_optional_raw("aw-watcher-web-chrome_\\"id"' in generated
     assert params.bid_window == 'window"id'
     assert params.bid_afk == 'afk"id'
     assert params.bid_browsers == ['aw-watcher-web-chrome_"id']
@@ -2040,7 +2668,7 @@ def test_full_desktop_query_serializes_quoted_bucket_ids_without_mutating_params
 
 def test_background_sources_require_active_mask():
     with pytest.raises(ValueError, match="require bid_afk or an active-time"):
-        canonicalEvents(
+        legacy_canonical_events(
             DesktopQueryParams(
                 filter_afk=False,
                 category_specs=[],
@@ -2055,7 +2683,7 @@ def test_background_sources_require_active_mask():
         )
 
 
-def test_legacy_window_query_avoids_new_server_functions_without_capabilities():
+def test_desktop_builder_targets_current_server_without_capabilities():
     generated = canonicalEvents(
         DesktopQueryParams(
             bid_window="window",
@@ -2064,9 +2692,9 @@ def test_legacy_window_query_avoids_new_server_functions_without_capabilities():
         )
     )
 
-    assert "events = legacy_activity;" in generated
-    assert "merge_subwatcher_fields" not in generated
-    assert "legacy_activity_period" not in generated
+    assert "query_period()" in generated
+    assert 'query_bucket_optional_raw(find_bucket("window")' in generated
+    assert "events = legacy_activity;" not in generated
 
 
 def test_legacy_window_projects_configured_fields():
@@ -2080,7 +2708,7 @@ def test_legacy_window_projects_configured_fields():
     )
 
     assert (
-        'events = merge_subwatcher_fields(events, legacy_activity, ["title","url"]);'
+        'events = merge_subwatcher_fields(events, coverage_source_0, ["title","url"]);'
         in generated
     )
 
@@ -2123,11 +2751,11 @@ def test_explicit_advanced_activity_can_disable_legacy_window_loading():
     )
 
     assert "legacy_activity" not in generated
-    assert 'query_bucket_optional("presence")' in generated
+    assert 'query_bucket_optional_raw("presence")' in generated
 
 
 def test_android_query_preserves_source_intervals_until_report_aggregation():
-    generated = canonicalEvents(
+    generated = legacy_canonical_events(
         AndroidQueryParams(
             bid_android="android",
             filter_afk=False,

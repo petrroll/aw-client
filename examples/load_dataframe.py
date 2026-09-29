@@ -2,28 +2,17 @@
 Load ActivityWatch data into a dataframe, and export as CSV.
 """
 
-import os
-import socket
 from datetime import datetime, timedelta, timezone
 
 import iso8601
 import pandas as pd
 from aw_client import ActivityWatchClient
-from aw_client.classes import default_classes
-from aw_client.queries import DesktopQueryParams, canonicalEvents
 
 
-def build_query() -> str:
-    hostname = "fakedata" if os.getenv("CI") else socket.gethostname()
-    canonicalQuery = canonicalEvents(
-        DesktopQueryParams(
-            bid_window=f"aw-watcher-window_{hostname}",
-            bid_afk=f"aw-watcher-afk_{hostname}",
-            classes=default_classes,
-        )
-    )
+def build_query(client: ActivityWatchClient) -> str:
+    profile = client.build_profile_query_v2()
     return f"""
-    {canonicalQuery}
+    {profile.query()}
     RETURN = {{"events": events}};
     """
 
@@ -34,7 +23,7 @@ def main() -> None:
 
     aw = ActivityWatchClient()
     print("Querying...")
-    query = build_query()
+    query = build_query(aw)
     data = aw.query(query, [(now - td30d, now)])
 
     events = [

@@ -360,8 +360,70 @@ class ActivityWatchClient:
         else:
             return self._get("settings").json()
 
-    def set_setting(self, key: str, value: str) -> None:
+    def set_setting(self, key: str, value: Any) -> None:
         self._post(f"settings/{key}", value)
+
+    def build_profile_query_v2(
+        self,
+        profile_id: Optional[str] = None,
+        hostname: Optional[str] = None,
+        filter_afk: bool = True,
+        filter_categories: Optional[List[List[str]]] = None,
+        explain_categories: bool = False,
+    ):
+        """Load and compile a profile using this client's actual server.
+
+        The returned ``MaterializedProfileV2`` exposes both the normalized
+        parameters and ``query()``.  Legacy settings are migrated in memory and
+        are never written by this read path.
+        """
+        from .rules_v2 import compile_profile_v2, load_rules_document
+
+        info = self.get_info()
+        capabilities = info.get("capabilities", [])
+        if not isinstance(capabilities, list):
+            capabilities = []
+        query_hostname = hostname or info.get("hostname")
+        if not isinstance(query_hostname, str) or not query_hostname:
+            raise ValueError("profile query requires a non-empty hostname")
+        return compile_profile_v2(
+            load_rules_document(
+                self, "settings.rules_v2.v1" in capabilities
+            ),
+            self.get_buckets(),
+            [item for item in capabilities if isinstance(item, str)],
+            hostname=query_hostname,
+            profile_id=profile_id,
+            filter_afk=filter_afk,
+            filter_categories=filter_categories,
+            explain_categories=explain_categories,
+        )
+
+    def query_profile_v2(
+        self,
+        timeperiods: List[Tuple[datetime, datetime]],
+        profile_id: Optional[str] = None,
+        hostname: Optional[str] = None,
+        filter_afk: bool = True,
+        filter_categories: Optional[List[List[str]]] = None,
+        explain_categories: bool = False,
+        name: Optional[str] = None,
+        cache: bool = False,
+    ) -> List[Any]:
+        """Execute the settings-aware canonical profile on this server."""
+        materialized = self.build_profile_query_v2(
+            profile_id=profile_id,
+            hostname=hostname,
+            filter_afk=filter_afk,
+            filter_categories=filter_categories,
+            explain_categories=explain_categories,
+        )
+        return self.query(
+            materialized.query() + "\nRETURN = events;",
+            timeperiods,
+            name=name,
+            cache=cache,
+        )
 
     #
     #   Connect and disconnect
